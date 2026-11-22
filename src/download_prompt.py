@@ -29,6 +29,8 @@ ROLES = {
     "large-v3-turbo": "the faster large model for NVIDIA graphics cards, and the one this PC is set to use",
     "small.en": "the model for dictating on the processor",
 }
+# Who converted OpenAI's model for faster-whisper (the owner of its Hugging Face repository).
+CONVERTERS = {"Systran": "Systran", "mobiuslabsgmbh": "Mobius Labs"}
 TIME_NOTE = ("The download takes a few minutes on a fast connection and longer on a slow one. "
              "Dictation starts when it is ready.")
 PRIVACY_NOTE = ("Only the model files are fetched. Nothing you dictate is sent anywhere, and MyTranscribe "
@@ -57,8 +59,10 @@ def describe(info, has_fallback: bool, model: str = "") -> tuple:
         if has_fallback and model != CPU_DEFAULT_MODEL:
             text += (f" Until it is downloaded, MyTranscribe uses Whisper {CPU_DEFAULT_MODEL}, which came with "
                      "the installer and is less accurate, especially with drug names.")
+        owner = repo.split("/")[0]
         return (f"Download Whisper {model}?", text, (
-            ("Model", f"Whisper {model}"), ("From", f"Hugging Face ({repo})"), ("Size", f"{size}, downloaded once"),
+            ("Model", f"Whisper {model}, by OpenAI (converted for faster-whisper by {CONVERTERS.get(owner, owner)})"),
+            ("From", f"Hugging Face ({repo})"), ("Size", f"{size}, downloaded once"),
             ("Account", "None needed: no sign-in and nothing to accept"),
             ("Licence", "MIT (OpenAI Whisper)")))
     text = f"{info.label} is not on this PC yet. " + (

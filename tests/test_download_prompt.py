@@ -21,6 +21,7 @@ def test_the_prompt_names_the_model_where_it_comes_from_and_how_long_it_takes(qa
     d = DownloadDialog(engines.ENGINES["whisper"], has_fallback=True, model="large-v3")
     text = _text(d)
     assert "Download Whisper large-v3?" in text and "most accurate model" in text
+    assert "Whisper large-v3, by OpenAI (converted for faster-whisper by Systran)" in text
     assert "Systran/faster-whisper-large-v3" in text and "about 3 GB, downloaded once" in text
     assert "no sign-in and nothing to accept" in text and "MIT" in text
     assert "Whisper small.en, which came with the installer" in text            # what is already here
@@ -30,6 +31,14 @@ def test_the_prompt_names_the_model_where_it_comes_from_and_how_long_it_takes(qa
     assert d.not_now_button.isDefault() and not d.download_button.autoDefault()  # Enter never downloads
     d.download_button.click()
     assert d.result() == 1
+
+
+def test_the_faster_model_names_its_own_converter(qapp):
+    from download_prompt import DownloadDialog
+
+    text = _text(DownloadDialog(engines.ENGINES["whisper"], has_fallback=True, model="large-v3-turbo"))
+    assert "by OpenAI (converted for faster-whisper by Mobius Labs)" in text
+    assert "mobiuslabsgmbh/faster-whisper-large-v3-turbo" in text and "about 1.6 GB" in text
 
 
 def test_without_a_known_model_the_prompt_describes_the_recogniser(qapp):
