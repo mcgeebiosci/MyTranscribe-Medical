@@ -13,6 +13,8 @@ import build_installer as bi
 @pytest.mark.skipif(not bi.CSC.is_file(), reason="Windows installer integration")
 def test_scratch_install_replace_update_and_remove(tmp_path):
     """Give the scratch stub unique registry and shortcut names before executing it."""
+    import os
+    import shutil
     import subprocess
     import uuid
     import winreg
@@ -35,7 +37,9 @@ def test_scratch_install_replace_update_and_remove(tmp_path):
     marker.write_text("unrelated")
     key = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\MyTranscribeTest{suffix}"
 
-    def run_fixture(version, kind="full"):
+    default = Path(os.environ["LOCALAPPDATA"], "Programs", f"MyTranscribeTest{suffix}")
+
+    def run_fixture(version, kind="full", folder=True):
         payload = tmp_path / "fixture.zip"
         with zipfile.ZipFile(payload, "w") as writer:
             writer.writestr("src/version.txt", version)
@@ -43,7 +47,7 @@ def test_scratch_install_replace_update_and_remove(tmp_path):
             if kind == "full":
                 writer.writestr("python/python.exe", b"fixture")
         setup = bi.join(stub, payload, tmp_path, version)
-        return subprocess.run([setup, "/S", "/noshortcuts", f"/D={dest}"], timeout=30).returncode
+        return subprocess.run([setup, "/S", "/noshortcuts", *([f"/D={dest}"] if folder else [])], timeout=30).returncode
 
     try:
         dest.mkdir()
@@ -53,6 +57,9 @@ def test_scratch_install_replace_update_and_remove(tmp_path):
         user_file.unlink()
         assert run_fixture("1") == 0
         assert run_fixture("2") == 0
+        # Without /D, a silent install replaces the installed copy, not one in the default folder.
+        assert run_fixture("2.1", folder=False) == 0 and not default.exists()
+        assert (dest / "src/version.txt").read_text() == "2.1"
         # A setup stopped part-way leaves a partly unpacked copy, and may have set the installed
         # copy aside just before the swap: the next setup puts that copy back and removes the rest.
         leftovers = lambda: list(tmp_path.glob("app.stage-*")) + list(tmp_path.glob("app.backup-" + "?" * 32))
@@ -79,6 +86,7 @@ def test_scratch_install_replace_update_and_remove(tmp_path):
         subprocess.run([helper, "/uninstall", "/S", f"/from={dest}"], check=True, timeout=30)
         assert not dest.exists() and not leftovers() and marker.read_text() == "unrelated"
     finally:
+        shutil.rmtree(default, ignore_errors=True)
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
         except FileNotFoundError:

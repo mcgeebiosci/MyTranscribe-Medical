@@ -39,7 +39,8 @@ Use a fresh build directory for a release.
 - **Licence page:** shows `LICENSE-NOTICE.txt` and installs only after "I accept".
 - **Per user, no administrator rights:** `%LOCALAPPDATA%\Programs\MyTranscribe Medical`, desktop
   and Start-menu shortcuts, an entry in Settings → Apps. Updating keeps the user's settings.
-- **Switches:** `/S` (silent; accepts the licence), `/D=<folder>`, `/noshortcuts`. Uninstall:
+- **Switches:** `/S` (silent; accepts the licence), `/D=<folder>` (default: the installed copy's
+  folder), `/noshortcuts`. Uninstall:
   `"<folder>\Uninstall MyTranscribe.exe" /uninstall [/S]`. Log: `%TEMP%\MyTranscribe-setup.log`.
 
 ## What goes in

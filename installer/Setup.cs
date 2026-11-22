@@ -21,7 +21,7 @@
 // goes wrong) and leaves Python, the packages, the speech model and the shortcuts as they are.
 //
 // Switches (for scripted tests and managed installs): /S silent (which accepts the licence terms in
-// LICENSE-NOTICE.txt), /D=<folder>, /noshortcuts, /uninstall. Windows 11 only (Requirements).
+// LICENSE-NOTICE.txt), /D=<folder> (default: the installed copy's folder), /noshortcuts, /uninstall. Windows 11 only (Requirements).
 
 using System;
 using System.Collections.Generic;
@@ -383,8 +383,10 @@ static class Installer
                 Log.Write("updated " + target + " to " + p.Version);
                 return 0;
             }
-            Install(p, o.Folder ?? Program.DefaultFolder(), !o.NoShortcuts, null);
-            Log.Write("installed to " + (o.Folder ?? Program.DefaultFolder()));
+            // Like the window: the installed copy's folder unless /D names another.
+            string folder = o.Folder ?? Program.InstalledFolder() ?? Program.DefaultFolder();
+            Install(p, folder, !o.NoShortcuts, null);
+            Log.Write("installed to " + folder);
             return 0;
         }
         catch (Exception ex)
