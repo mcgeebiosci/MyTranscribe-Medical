@@ -16,6 +16,7 @@ way: Google gates it behind terms each user accepts with their own account.
 import importlib.util
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -167,6 +168,9 @@ def fallback_model(name: str = DEFAULT) -> Optional[Path]:
     return bundled_model(CPU_DEFAULT_MODEL) if name == "whisper" else None
 
 
+_load_lock = threading.Lock()
+
+
 def build(name: str = DEFAULT, accurate: bool = True, allow_download: bool = False, language: str = "en",
           fallback: bool = False):
     """
@@ -180,27 +184,22 @@ def build(name: str = DEFAULT, accurate: bool = True, allow_download: bool = Fal
     ok, why = availability(name)
     if not ok:
         raise RuntimeError(f"{ENGINES[name].label} cannot be used: {why}")
-    previous = os.environ.get("HF_HUB_OFFLINE")
-    try:
-        if allow_download:
-            os.environ["HF_HUB_OFFLINE"] = "0"
-            _use_system_certificates()
-        else:
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        _hub_offline(not allow_download and os.environ["HF_HUB_OFFLINE"] == "1")
+    # The hub caches its process-wide offline flag. Serialize model loads so a
+    # consenting load cannot open the network for a concurrent offline load.
+    with _load_lock:
         try:
+            os.environ["HF_HUB_OFFLINE"] = "0" if allow_download else "1"
+            _hub_offline(not allow_download)
+            if allow_download:
+                _use_system_certificates()
             return _build(name, accurate, language, fallback=fallback)
         except Exception as exc:
             if not allow_download and _is_missing_model(exc):
                 raise ModelNotDownloaded(name) from exc
             raise
-    finally:
-        if allow_download:
-            if previous is None:
-                os.environ["HF_HUB_OFFLINE"] = "1"
-            else:
-                os.environ["HF_HUB_OFFLINE"] = previous
-            _hub_offline(os.environ["HF_HUB_OFFLINE"] == "1")
+        finally:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            _hub_offline(True)
 
 
 def _build(name: str, accurate: bool, language: str = "en", fallback: bool = False):

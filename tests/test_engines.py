@@ -43,11 +43,14 @@ def test_a_missing_model_becomes_a_question_not_a_download(monkeypatch):
         pass
 
     def offline_load(name, accurate, language="en", fallback=False):
+        import os
+        from huggingface_hub import constants
+        assert os.environ["HF_HUB_OFFLINE"] == "1" and constants.HF_HUB_OFFLINE
         raise LocalEntryNotFoundError("Cannot find the requested files in the local cache")
 
     monkeypatch.setattr(engines, "_build", offline_load)
     monkeypatch.setattr(engines, "availability", lambda name: (True, ""))
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     with pytest.raises(engines.ModelNotDownloaded) as err:
         engines.build("whisper")
     assert err.value.engine == "whisper"
