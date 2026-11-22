@@ -168,17 +168,18 @@ def model_line(s: Settings, hw=None) -> str:
 
 
 def download_note(hw) -> str:
-    """Where the speech model comes from on this PC: shipped with the installer, or asked for."""
+    """Where the speech model comes from on this PC: shipped with the installer, or downloaded when setup finishes."""
     from hw_profile import CPU_DEFAULT_MODEL, GPU_ACCURATE_MODEL, GPU_DEFAULT_MODEL
     processor = hw is not None and not hw.cuda_device_count
     names = [CPU_DEFAULT_MODEL] if processor else [GPU_ACCURATE_MODEL, GPU_DEFAULT_MODEL]
     if any(engines.bundled_model(n) is not None for n in names):
         return "The speech model came with the installer: nothing is downloaded, and it works offline."
     size = "about 0.5 GB" if processor else "about 3 GB, or 1.6 GB for the faster model"
-    note = (f"If the model is not on this PC yet, MyTranscribe asks before downloading it ({size}, once). "
-            "After that it works offline.")
+    note = (f"If the model is not on this PC yet, MyTranscribe downloads it from Hugging Face when you finish "
+            f"setup ({size}, once; no account or sign-in needed). That takes a few minutes; after that it "
+            "works offline.")
     if not processor and engines.fallback_model() is not None:
-        note += (f" Until then, or if you say no, it uses the smaller model that came with the installer "
+        note += (f" If the download does not work, it uses the smaller model that came with the installer "
                  f"({CPU_DEFAULT_MODEL}).")
     return note
 

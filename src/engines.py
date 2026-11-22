@@ -43,8 +43,8 @@ class EngineInfo:
 ENGINES = {
     "whisper": EngineInfo(
         "whisper", "Whisper (recommended)", ("faster_whisper",),
-        "Hugging Face: Systran/faster-whisper-large-v3 (or -large-v3-turbo for Fast; -small.en without an "
-        "NVIDIA card)", "about 3 GB (turbo 1.6 GB, small.en 0.5 GB)",
+        "Hugging Face: Systran/faster-whisper-large-v3 (most accurate), mobiuslabsgmbh/faster-whisper-large-v3-turbo "
+        "(faster) or Systran/faster-whisper-small.en (processor)", "about 3 GB (turbo 1.6 GB, small.en 0.5 GB)",
         "MIT (OpenAI Whisper weights, Systran conversion); no account or acceptance needed",
         "The most accurate choice, with the medical vocabulary: large-v3 on an NVIDIA graphics card, "
         "small.en on the processor."),
@@ -70,12 +70,21 @@ ENGINES = {
 }
 
 
-class ModelNotDownloaded(RuntimeError):
-    """The chosen model is not on this PC and the hub is offline."""
+# The Whisper models the app may download: Hugging Face repository (as faster-whisper fetches it) and size.
+WHISPER_DOWNLOADS = {
+    "large-v3": ("Systran/faster-whisper-large-v3", "about 3 GB"),
+    "large-v3-turbo": ("mobiuslabsgmbh/faster-whisper-large-v3-turbo", "about 1.6 GB"),
+    "small.en": ("Systran/faster-whisper-small.en", "about 0.5 GB"),
+}
 
-    def __init__(self, engine: str, detail: str = "") -> None:
+
+class ModelNotDownloaded(RuntimeError):
+    """The chosen model is not on this PC and the hub is offline. model: which one (Whisper), if known."""
+
+    def __init__(self, engine: str, detail: str = "", model: str = "") -> None:
         super().__init__(f"The {ENGINES[engine].label} model is not on this PC yet. {detail}".strip())
         self.engine = engine
+        self.model = model
 
 
 def medasr_snapshot(env: Optional[dict] = None) -> Optional[Path]:
@@ -195,7 +204,7 @@ def build(name: str = DEFAULT, accurate: bool = True, allow_download: bool = Fal
             return _build(name, accurate, language, fallback=fallback)
         except Exception as exc:
             if not allow_download and _is_missing_model(exc):
-                raise ModelNotDownloaded(name) from exc
+                raise ModelNotDownloaded(name, model=getattr(exc, "whisper_model", "")) from exc
             raise
         finally:
             os.environ["HF_HUB_OFFLINE"] = "1"
@@ -221,7 +230,11 @@ def _build(name: str, accurate: bool, language: str = "en", fallback: bool = Fal
             cfg.model = str(bundled_model(cfg.model))   # installed with the app
         logger.info("Engine config: model=%s device=%s compute=%s threads=%d (%s)",
                     cfg.model, cfg.device, cfg.compute_type, cfg.cpu_threads, cfg.reason)
-        engine = FasterWhisperEngine(cfg)
+        try:
+            engine = FasterWhisperEngine(cfg)
+        except Exception as exc:
+            exc.whisper_model = cfg.model         # which model was missing, for the download prompt
+            raise
     elif name == "medasr":
         from medasr_engine import MedASREngine
         import torch

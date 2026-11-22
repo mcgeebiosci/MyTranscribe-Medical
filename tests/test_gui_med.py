@@ -24,7 +24,7 @@ def make_window(qapp, monkeypatch, tmp_path):
     windows = []
 
     def make(engine=None, stream=None, autopaste=False, engine_factory=None, clip=None, settings=None,
-             mic_warmup_s=None):
+             mic_warmup_s=None, setup_consent=False):
         engine = engine or FakeEngine()
         stream = stream or EndlessStream(speech_like(3), pace_s=0.002)
         w = gui_med.MedTranscriptionWindow(
@@ -33,6 +33,7 @@ def make_window(qapp, monkeypatch, tmp_path):
             autopaste=autopaste, base_prompt="Vocab.", text_pipeline=(None, None),
             settings=settings or Settings(start_compact=False),
             settings_path=tmp_path / "settings.json", install_hooks=False, mic_warmup_s=mic_warmup_s,
+            setup_consent=setup_consent,
         )
         chimes = []
         w._chime._inner = type("Chime", (), {"play_start": lambda s: chimes.append("start"),
