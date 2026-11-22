@@ -36,4 +36,4 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 - Speech models: OpenAI Whisper (MIT License).
 - Word lists: wordfreq data (CC BY-SA 4.0) and the Telnyx medical pronunciation dictionary (CC BY 4.0).
 
-After installation, THIRD-PARTY.txt, NOTICE.md and the licenses folder in the program folder list every component with its licence text. Overview: https://github.com/seanmichaelmcgee/MyTranscribe-Medical/blob/trunk/LICENSES.md
+After installation, THIRD-PARTY.txt, NOTICE.md and the licenses folder in the program folder list every component with its licence text. Overview: https://github.com/mcgeebiosci/MyTranscribe-Medical/blob/trunk/LICENSES.md
