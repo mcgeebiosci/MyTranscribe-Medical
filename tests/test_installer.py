@@ -128,6 +128,7 @@ def test_updates_and_reused_stages_must_be_the_same_edition(tmp_path):
 
 def test_every_pc_build_packs_the_nvidia_libraries_under_the_usual_name(tmp_path, monkeypatch):
     seen = {}
+    monkeypatch.setattr(bi, "verify_app_payload", lambda setup: None)
     monkeypatch.setattr(bi, "stage", lambda out, models, version, device: seen.update(device=device) or out / "st")
     monkeypatch.setattr(bi, "zip_stage", lambda st, out: out / "p.zip")
     monkeypatch.setattr(bi, "compile_stub", lambda out, icon, gpu: seen.update(gpu_stub=gpu) or out / "stub")
@@ -195,3 +196,19 @@ def test_the_installer_is_compiled_as_utf8_so_its_text_is_not_garbled(tmp_path):
     if bi.CSC.is_file():
         exe = bi.compile_stub(tmp_path, bi.REPO / "src" / "assets" / "mytranscribe.ico").read_bytes()
         assert "  ·  needs ".encode("utf-16-le") in exe and "Copying files…".encode("utf-16-le") in exe
+
+def test_release_manifest_and_final_archive(tmp_path):
+    import zipfile
+
+    paths = bi.app_files()
+    assert len(paths) == len(set(paths))
+    stage = tmp_path / "stage"
+    bi._copy_app(stage)
+    assert {p.relative_to(stage).as_posix() for p in (stage / "src").rglob("*") if p.is_file()} == set(paths)
+    (stage / "build_info.json").write_text(json.dumps({"kind": "update"}))
+    archive = bi.zip_stage(stage, tmp_path)
+    bi.verify_app_payload(archive)
+    with zipfile.ZipFile(archive, "a") as writer:
+        writer.writestr("src/development-notes.txt", "fixture")
+    with pytest.raises(ValueError, match="inventory"):
+        bi.verify_app_payload(archive)

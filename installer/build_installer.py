@@ -35,7 +35,6 @@ The installer itself (what it does on the user's PC) is described in installer/R
 """
 
 import argparse
-import compileall
 import json
 import os
 import re
@@ -44,6 +43,7 @@ import struct
 import subprocess
 import sys
 import zipfile
+from email.parser import BytesHeaderParser
 from importlib import metadata
 from pathlib import Path
 
@@ -322,18 +322,53 @@ def stage(out: Path, models, version: str, device: str = "cpu") -> Path:
     info = {"version": version, "kind": "full", "device": device,
             "models": [Path(m).name for m in models], "python": sys.version.split()[0]}
     (st / "build_info.json").write_text(json.dumps(info, indent=1), encoding="utf-8")
-    print("Compiling Python files ...")
-    compileall.compile_dir(str(st), quiet=1, workers=0)
     total = sum(f.stat().st_size for f in st.rglob("*") if f.is_file())
     print(f"Staged {total / 1e9:.2f} GB in {st}")
     return st
 
 
+def app_files() -> list[str]:
+    return (HERE / "app-files.txt").read_text(encoding="utf-8").splitlines()
+
+
+def verify_app_payload(setup: Path) -> None:
+    """Read the delivered archive, including split-data builds and reused stages."""
+    data = setup.with_suffix(".data")
+    expected = {name: REPO / name for name in app_files()}
+    expected["LICENSE-NOTICE.txt"] = HERE / "LICENSE-NOTICE.txt"
+    with zipfile.ZipFile(data if data.exists() else setup) as archive:
+        names = archive.namelist()
+        actual = {n for n in names if n.startswith("src/")}
+        if actual != set(app_files()) or len(set(n.casefold() for n in names)) != len(names):
+            raise ValueError("Unexpected application inventory in installer")
+        for name in names:
+            if "__pycache__" in Path(name).parts or name.endswith(".pyc"):
+                raise ValueError(f"Unexpected bytecode in installer: {name}")
+        info = json.loads(archive.read("build_info.json"))
+        if info["kind"] == "full":
+            packages = {}
+            for name in names:
+                if name.endswith(".dist-info/METADATA"):
+                    meta = BytesHeaderParser().parsebytes(archive.read(name))
+                    packages[meta["Name"].lower().replace("_", "-")] = meta["Version"]
+            for line in (REPO / "requirements.txt").read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    req = Requirement(line)
+                    version = packages.get(req.name.lower())
+                    if version and version not in req.specifier:
+                        raise ValueError(f"Bundled {req.name} {version} does not meet {req}")
+        for name, source in expected.items():
+            if archive.read(name) != source.read_bytes():
+                raise ValueError(f"Installer differs from release source: {name}")
+
+
 def _copy_app(st: Path) -> None:
     """The app itself, as the full installer and an update package both carry it."""
-    def ignore_src(folder, names):
-        return [n for n in names if n in ("__pycache__",) or n.endswith(".pyc")]
-    shutil.copytree(REPO / "src", st / "src", ignore=ignore_src)
+    for name in app_files():
+        dest = st / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / name, dest)
     for name in ("LICENSE.txt", "NOTICE.md"):
         if (REPO / name).is_file():
             shutil.copy2(REPO / name, st / name)
@@ -386,7 +421,6 @@ def stage_update(out: Path, version: str, base: Path, device: str = "cpu") -> Pa
     if info["python"] != base_info.get("python"):
         raise SystemExit(f"Python here is {info['python']}, the full build has {base_info.get('python')}.")
     (st / "build_info.json").write_text(json.dumps(info, indent=1), encoding="utf-8")
-    compileall.compile_dir(str(st), quiet=1, workers=0)
     total = sum(f.stat().st_size for f in st.rglob("*") if f.is_file())
     print(f"Staged update {total / 1e6:.1f} MB in {st} (for full build {info['base']})")
     return st
@@ -484,7 +518,8 @@ def main(argv=None):
         ap.error("--model is needed for the full installer")
     payload = zip_stage(st, args.out)
     stub = compile_stub(args.out, REPO / "src" / "assets" / "mytranscribe.ico", args.gpu)
-    join(stub, payload, args.out, args.version, "Update" if args.update else "Setup", args.gpu)
+    setup = join(stub, payload, args.out, args.version, "Update" if args.update else "Setup", args.gpu)
+    verify_app_payload(setup)
 
 
 if __name__ == "__main__":
