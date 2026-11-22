@@ -6,6 +6,7 @@ src/audio_devices.py
 src/chunked_transcriber.py
 src/classical_terms.py
 src/dictation_fixes.py
+src/download_prompt.py
 src/drug_names.py
 src/engines.py
 src/fw_engine.py

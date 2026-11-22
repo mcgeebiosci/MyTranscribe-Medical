@@ -44,7 +44,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QTextEdit,
+    QApplication, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -461,15 +461,9 @@ class MedTranscriptionWindow(TranscriptionWindow):
 
     def _confirm_download(self, engine: str) -> bool:
         """Ask before fetching a model: what, from where, how big, under which licence."""
-        info = engines.ENGINES[engine]
-        answer = QMessageBox.question(
-            self, "Download the speech model?",
-            f"{info.label} is not on this PC yet.\n\nDownload it now?\n\n"
-            f"From: {info.source}\nSize: {info.size}\nLicence: {info.licence}\n\n"
-            "Only the model files are fetched. Nothing you dictate is sent anywhere, and the app goes back "
-            "to working offline afterwards.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
-        return answer == QMessageBox.StandardButton.Yes
+        from download_prompt import DownloadDialog
+        dialog = DownloadDialog(engines.ENGINES[engine], engines.fallback_model(engine) is not None, parent=self)
+        return bool(dialog.exec())
 
     def _apply_mic_gain(self) -> None:
         """Options -> Microphone gain; takes effect from the next recording."""
@@ -1206,6 +1200,16 @@ def set_app_identity() -> None:
         pass
 
 
+def apply_app_theme(app: QApplication) -> None:
+    """
+    The warm light theme everywhere, also when Windows is in dark mode: Qt then gives dialogs,
+    menus and tooltips a dark palette, on which the style sheet's dark text cannot be read.
+    """
+    if hasattr(app.styleHints(), "setColorScheme"):          # Qt 6.8+
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    app.setStyleSheet(MED_QSS)
+
+
 def main() -> None:
     os.chdir(Path(__file__).parent)
     app_log.setup(to_file=True)         # works with pythonw.exe too (no console window)
@@ -1224,7 +1228,7 @@ def main() -> None:
     if icon.is_file():
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(str(icon)))
-    app.setStyleSheet(MED_QSS)
+    apply_app_theme(app)
     logger.info("Starting MyTranscribe Medical (faster-whisper); hotkey Ctrl+Alt+Q")
 
     window = MedTranscriptionWindow(settings=first_start_settings())

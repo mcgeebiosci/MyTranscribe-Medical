@@ -212,3 +212,21 @@ def test_release_manifest_and_final_archive(tmp_path):
         writer.writestr("src/development-notes.txt", "fixture")
     with pytest.raises(ValueError, match="inventory"):
         bi.verify_app_payload(archive)
+
+
+def test_every_app_module_that_is_imported_is_shipped():
+    """A module missing from app-files.txt would only fail on a user's PC, when it is first imported."""
+    import ast
+
+    listed = set(bi.app_files())
+    missing = set()
+    for name in listed:
+        if name.endswith(".py"):
+            for node in ast.walk(ast.parse((bi.REPO / name).read_text(encoding="utf-8"))):
+                modules = ([a.name for a in node.names] if isinstance(node, ast.Import) else
+                           [node.module] if isinstance(node, ast.ImportFrom) and node.module and not node.level else [])
+                for module in modules:
+                    path = f"src/{module.split('.')[0]}.py"
+                    if (bi.REPO / path).is_file() and path not in listed:
+                        missing.add(path)
+    assert not missing
