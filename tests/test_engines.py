@@ -43,11 +43,14 @@ def test_a_missing_model_becomes_a_question_not_a_download(monkeypatch):
         pass
 
     def offline_load(name, accurate, language="en", fallback=False):
+        import os
+        from huggingface_hub import constants
+        assert os.environ["HF_HUB_OFFLINE"] == "1" and constants.HF_HUB_OFFLINE
         raise LocalEntryNotFoundError("Cannot find the requested files in the local cache")
 
     monkeypatch.setattr(engines, "_build", offline_load)
     monkeypatch.setattr(engines, "availability", lambda name: (True, ""))
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     with pytest.raises(engines.ModelNotDownloaded) as err:
         engines.build("whisper")
     assert err.value.engine == "whisper"
@@ -62,6 +65,101 @@ def test_a_missing_model_becomes_a_question_not_a_download(monkeypatch):
     assert engines.build("whisper", allow_download=True) == "engine"
     import os
     assert seen["offline"] == "0" and os.environ["HF_HUB_OFFLINE"] == "1"     # offline again afterwards
+
+
+def test_the_question_names_the_missing_whisper_model(monkeypatch):
+    from types import SimpleNamespace
+    import fw_engine
+    import hw_profile
+
+    class LocalEntryNotFoundError(Exception):
+        pass
+
+    def missing(cfg):
+        raise LocalEntryNotFoundError("Cannot find the requested files in the local cache")
+
+    monkeypatch.setattr(engines, "availability", lambda name: (True, ""))
+    monkeypatch.setattr(engines, "bundled_model", lambda name: None)
+    monkeypatch.setattr(hw_profile, "detect_hardware", lambda: None)
+    monkeypatch.setattr(hw_profile, "choose_config", lambda hw, accurate: SimpleNamespace(
+        model="large-v3" if accurate else "large-v3-turbo", device="cuda", compute_type="int8_float16",
+        cpu_threads=2, reason="test"))
+    monkeypatch.setattr(fw_engine, "FasterWhisperEngine", missing)
+    with pytest.raises(engines.ModelNotDownloaded) as err:
+        engines.build("whisper", accurate=True)
+    assert err.value.model == "large-v3"
+
+
+def test_the_download_list_matches_what_faster_whisper_fetches():
+    from faster_whisper.utils import _MODELS
+    assert {m: repo for m, (repo, _) in engines.WHISPER_DOWNLOADS.items()} == {m: _MODELS[m] for m in engines.WHISPER_DOWNLOADS}
+    for model, (repo, _) in engines.WHISPER_DOWNLOADS.items():
+        assert repo in engines.ENGINES["whisper"].source
+
+
+def test_finishing_setup_downloads_a_missing_model_without_asking_again(qapp, make_window, monkeypatch):
+    import gui_med
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download",
+                        lambda self, engine, model="": pytest.fail("asked again after setup"))
+    allowed = []
+
+    def factory():
+        allowed.append(w_holder[0]._allow_download if w_holder else False)
+        if len(allowed) == 1:
+            raise engines.ModelNotDownloaded("whisper", model="large-v3")
+        return FakeEngine()
+
+    w_holder = []
+    w = make_window(engine_factory=factory, setup_consent=True)
+    w_holder.append(w)
+    assert wait_for(lambda: w.ready, app=qapp)
+    assert allowed == [False, True] and not w._setup_consent      # tried offline first, then downloaded
+
+
+def test_rerunning_setup_on_the_stand_in_model_fetches_the_chosen_one(qapp, make_window, monkeypatch):
+    import gui_med
+    monkeypatch.setattr(engines, "fallback_model", lambda name: Path("small.en") if name == "whisper" else None)
+    answers = [False]                                          # the first prompt: Not now; never asked again
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download",
+                        lambda self, engine, model="": answers.pop(0))
+    allowed = []
+
+    def factory():
+        allowed.append(holder[0]._allow_download if holder else False)
+        if len(allowed) in (1, 3):
+            raise engines.ModelNotDownloaded("whisper", model="large-v3")
+        return FakeEngine()
+
+    holder = []
+    w = make_window(engine_factory=factory)
+    holder.append(w)
+    assert wait_for(lambda: w.ready and w._fell_back, app=qapp)
+    wizard = type("Wizard", (), {"exec": lambda self: True, "result_settings": lambda self: w._settings})()
+    assert w.run_setup(wizard_factory=lambda: wizard)
+    assert wait_for(lambda: w.ready and not w._fell_back, app=qapp)
+    assert allowed == [False, False, False, True] and not answers
+
+
+def test_the_download_is_shown_in_the_status_line(qapp, make_window, monkeypatch):
+    import threading
+    import gui_med
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download", lambda self, engine, model="": True)
+    release = threading.Event()
+    calls = []
+
+    def factory():
+        calls.append(1)
+        if len(calls) == 1:
+            raise engines.ModelNotDownloaded("whisper", model="large-v3")
+        release.wait(10)
+        return FakeEngine()
+
+    w = make_window(engine_factory=factory)
+    assert wait_for(lambda: len(calls) == 2, app=qapp)
+    assert w._status_text.text() == "Downloading the speech model…"
+    assert "Whisper large-v3 (about 3 GB)" in w._text_area.toPlainText()
+    release.set()
+    assert wait_for(lambda: w.ready, app=qapp)
 
 
 def test_accuracy_choices_are_the_large_models_this_copy_has():
@@ -239,7 +337,7 @@ def test_a_model_that_is_not_downloaded_asks_first(qapp, make_window, monkeypatc
     import gui_med
     asked = []
     monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download",
-                        lambda self, engine: asked.append(engine) or True)
+                        lambda self, engine, model="": asked.append(engine) or True)
     w = make_window(engine_factory=factory)                    # make_window waits for ready or an error
     w_holder.append(w)
     assert wait_for(lambda: w.ready, app=qapp)
@@ -248,7 +346,7 @@ def test_a_model_that_is_not_downloaded_asks_first(qapp, make_window, monkeypatc
 
 def test_declining_the_download_leaves_a_clear_message(qapp, make_window, monkeypatch):
     import gui_med
-    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download", lambda self, engine: False)
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download", lambda self, engine, model="": False)
 
     def factory():
         raise engines.ModelNotDownloaded("parakeet")
@@ -264,7 +362,8 @@ def test_without_the_download_the_installers_own_model_stands_in(qapp, make_wind
     """Declined (or the download failed): an install that came with small.en uses it, and says so."""
     import gui_med
     monkeypatch.setattr(engines, "fallback_model", lambda name: Path("small.en") if name == "whisper" else None)
-    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download", lambda self, engine: download)
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download",
+                        lambda self, engine, model="": download)
     calls = []
 
     def factory():

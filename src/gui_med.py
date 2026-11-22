@@ -44,7 +44,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QTextEdit,
+    QApplication, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -101,6 +101,14 @@ DOWNLOAD_FAILED_TEXT = ("The download did not work, so MyTranscribe is using the
                         "says why; a certificate error usually means security software is inspecting secure "
                         "connections. MyTranscribe offers the download again the next time it starts.")
 TRANSCRIBING_SUFFIX = "\n\n[Finishing transcription…]"
+
+
+def downloading_text(model: str = "") -> str:
+    """The transcript area while a model downloads: which one, how big, how long."""
+    size = engines.WHISPER_DOWNLOADS.get(model, ("", ""))[1]
+    what = f"Whisper {model} ({size})" if size else "the speech model"
+    return (f"Downloading {what}… This takes a few minutes on a fast connection and longer on a slow one; "
+            "dictation starts when it is ready.")
 NORMAL_SIZE = (560, 300)
 COMPACT_WIDTH = 320
 
@@ -251,7 +259,8 @@ class MedTranscriptionWindow(TranscriptionWindow):
                  settings: Optional["settings_store.Settings"] = None,
                  settings_path: Optional[Path] = None,
                  install_hooks: bool = True,
-                 mic_warmup_s: Optional[float] = None) -> None:
+                 mic_warmup_s: Optional[float] = None,
+                 setup_consent: bool = False) -> None:
         self._injected_stream = stream_factory is not None
         self._stream_factory = stream_factory
         self._ready_mic = None
@@ -266,6 +275,9 @@ class MedTranscriptionWindow(TranscriptionWindow):
         self._sync_autopaste()
         self._allow_download = False   # set for one load after the user agrees to fetch a model
         self._downloading = False      # the load in progress fetches a model
+        # Setup has just finished, and it said a missing model is downloaded then: the next load
+        # fetches it without asking again (cleared once a load succeeds or has used it).
+        self._setup_consent = setup_consent
         self._fall_back = False        # set for one load: the installer's own model (engines.fallback_model)
         self._fell_back = False        # the loaded model is that stand-in
         self._fallback_note = FALLBACK_TEXT
@@ -380,10 +392,13 @@ class MedTranscriptionWindow(TranscriptionWindow):
             exc, downloading = self._load_exc, self._downloading
             self._downloading = False
             missing = isinstance(exc, engines.ModelNotDownloaded)
-            if missing and self._confirm_download(exc.engine):
+            consent, self._setup_consent = self._setup_consent, False
+            model = getattr(exc, "model", "")
+            if missing and (consent or self._confirm_download(exc.engine, model)):
                 self._allow_download = self._downloading = True
                 self._start_load()
-                self._text_area.setPlainText("Downloading the speech model… this can take several minutes.")
+                self._set_status("Downloading the speech model…", "busy")   # also seen in compact view
+                self._text_area.setPlainText(downloading_text(model))
                 return
             if (missing or downloading) and self._start_fallback(getattr(exc, "engine", self._settings.engine),
                                                                  failed_download=downloading):
@@ -395,6 +410,7 @@ class MedTranscriptionWindow(TranscriptionWindow):
             )
             self._set_status("Model failed to load", "warn")
             return
+        self._setup_consent = False
         builder, corrector = self._text_pipeline
         self._transcriber = ChunkedTranscriber(
             self._engine, self._base_prompt,
@@ -459,17 +475,12 @@ class MedTranscriptionWindow(TranscriptionWindow):
         self._start_load()
         return True
 
-    def _confirm_download(self, engine: str) -> bool:
-        """Ask before fetching a model: what, from where, how big, under which licence."""
-        info = engines.ENGINES[engine]
-        answer = QMessageBox.question(
-            self, "Download the speech model?",
-            f"{info.label} is not on this PC yet.\n\nDownload it now?\n\n"
-            f"From: {info.source}\nSize: {info.size}\nLicence: {info.licence}\n\n"
-            "Only the model files are fetched. Nothing you dictate is sent anywhere, and the app goes back "
-            "to working offline afterwards.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
-        return answer == QMessageBox.StandardButton.Yes
+    def _confirm_download(self, engine: str, model: str = "") -> bool:
+        """Ask before fetching a model: which one, from where, how big, under which licence."""
+        from download_prompt import DownloadDialog
+        dialog = DownloadDialog(engines.ENGINES[engine], engines.fallback_model(engine) is not None, model,
+                                parent=self)
+        return bool(dialog.exec())
 
     def _apply_mic_gain(self) -> None:
         """Options -> Microphone gain; takes effect from the next recording."""
@@ -1149,7 +1160,12 @@ class MedTranscriptionWindow(TranscriptionWindow):
             return False
         backup = (self._settings_path or settings_store.default_path()).with_name("settings.before-setup.json")
         settings_store.save(old, backup)
+        self._setup_consent = True               # setup said finishing it downloads a missing model
         self.apply_settings(wizard.result_settings())
+        if self._fell_back and not (self._load_thread.is_alive() or self._reload_pending):
+            self._reload_engine()                # on the stand-in model: fetch the chosen one now
+        if not (self._load_thread.is_alive() or self._reload_pending):
+            self._setup_consent = False
         logger.info("Setup wizard finished; settings applied")
         return True
 
@@ -1206,6 +1222,16 @@ def set_app_identity() -> None:
         pass
 
 
+def apply_app_theme(app: QApplication) -> None:
+    """
+    The warm light theme everywhere, also when Windows is in dark mode: Qt then gives dialogs,
+    menus and tooltips a dark palette, on which the style sheet's dark text cannot be read.
+    """
+    if hasattr(app.styleHints(), "setColorScheme"):          # Qt 6.8+
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    app.setStyleSheet(MED_QSS)
+
+
 def main() -> None:
     os.chdir(Path(__file__).parent)
     app_log.setup(to_file=True)         # works with pythonw.exe too (no console window)
@@ -1224,10 +1250,12 @@ def main() -> None:
     if icon.is_file():
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(str(icon)))
-    app.setStyleSheet(MED_QSS)
+    apply_app_theme(app)
     logger.info("Starting MyTranscribe Medical (faster-whisper); hotkey Ctrl+Alt+Q")
 
-    window = MedTranscriptionWindow(settings=first_start_settings())
+    settings = first_start_settings()
+    # A finished first-start wizard (setup_version set) has told the user the model is downloaded.
+    window = MedTranscriptionWindow(settings=settings, setup_consent=bool(settings and settings.setup_version))
     window.show()
     sys.exit(app.exec())
 

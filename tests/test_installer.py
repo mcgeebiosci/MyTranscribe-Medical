@@ -128,6 +128,7 @@ def test_updates_and_reused_stages_must_be_the_same_edition(tmp_path):
 
 def test_every_pc_build_packs_the_nvidia_libraries_under_the_usual_name(tmp_path, monkeypatch):
     seen = {}
+    monkeypatch.setattr(bi, "verify_app_payload", lambda setup: None)
     monkeypatch.setattr(bi, "stage", lambda out, models, version, device: seen.update(device=device) or out / "st")
     monkeypatch.setattr(bi, "zip_stage", lambda st, out: out / "p.zip")
     monkeypatch.setattr(bi, "compile_stub", lambda out, icon, gpu: seen.update(gpu_stub=gpu) or out / "stub")
@@ -180,7 +181,8 @@ def test_qt_ships_under_the_lgpl_with_the_gpl_text_it_builds_on(tmp_path):
 def test_the_installer_shows_the_licence_terms_and_asks_for_windows_11(tmp_path):
     notice = (bi.HERE / "LICENSE-NOTICE.txt").read_text(encoding="utf-8")
     assert "MIT License" in notice and "GNU LGPL version 3" in notice and "not a medical device" in notice
-    assert "PyQt" not in notice and len(notice.splitlines()) < 60                 # short: details are installed
+    assert "PyQt" not in notice and len(notice.splitlines()) < 80                 # short: details are installed
+    assert "small open-source project" in notice and "not liable for any loss, injury or damage" in notice
     if bi.CSC.is_file():
         exe = bi.compile_stub(tmp_path, bi.REPO / "src" / "assets" / "mytranscribe.ico").read_bytes()
         for text in ("I accept the licence terms", "LICENSE-NOTICE.txt", " needs Windows 11."):
@@ -194,3 +196,37 @@ def test_the_installer_is_compiled_as_utf8_so_its_text_is_not_garbled(tmp_path):
     if bi.CSC.is_file():
         exe = bi.compile_stub(tmp_path, bi.REPO / "src" / "assets" / "mytranscribe.ico").read_bytes()
         assert "  ·  needs ".encode("utf-16-le") in exe and "Copying files…".encode("utf-16-le") in exe
+
+def test_release_manifest_and_final_archive(tmp_path):
+    import zipfile
+
+    paths = bi.app_files()
+    assert len(paths) == len(set(paths))
+    stage = tmp_path / "stage"
+    bi._copy_app(stage)
+    assert {p.relative_to(stage).as_posix() for p in (stage / "src").rglob("*") if p.is_file()} == set(paths)
+    (stage / "build_info.json").write_text(json.dumps({"kind": "update"}))
+    archive = bi.zip_stage(stage, tmp_path)
+    bi.verify_app_payload(archive)
+    with zipfile.ZipFile(archive, "a") as writer:
+        writer.writestr("src/development-notes.txt", "fixture")
+    with pytest.raises(ValueError, match="inventory"):
+        bi.verify_app_payload(archive)
+
+
+def test_every_app_module_that_is_imported_is_shipped():
+    """A module missing from app-files.txt would only fail on a user's PC, when it is first imported."""
+    import ast
+
+    listed = set(bi.app_files())
+    missing = set()
+    for name in listed:
+        if name.endswith(".py"):
+            for node in ast.walk(ast.parse((bi.REPO / name).read_text(encoding="utf-8"))):
+                modules = ([a.name for a in node.names] if isinstance(node, ast.Import) else
+                           [node.module] if isinstance(node, ast.ImportFrom) and node.module and not node.level else [])
+                for module in modules:
+                    path = f"src/{module.split('.')[0]}.py"
+                    if (bi.REPO / path).is_file() and path not in listed:
+                        missing.add(path)
+    assert not missing

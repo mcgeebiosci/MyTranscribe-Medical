@@ -25,7 +25,13 @@ into the install's `THIRD-PARTY.txt`.
 
 About a minute. Output: `MyTranscribe-Medical-Setup-<version>.exe`. Windows will not start a
 program of 4 GiB or more, so a larger build comes as the program plus a `.data` file beside it.
-`--update` builds a small package that replaces only `src\` in an installed copy.
+Build a **full installer** whenever bundled dependencies change. An update package replaces the
+app source, release metadata and uninstaller in a registered copy with the matching runtime.
+
+The builder copies application files listed in [app-files.txt](app-files.txt). Update this list
+when adding runtime source or assets. After assembling the executable, the builder checks its
+source inventory and bytes, licence notice, bundled package versions and absence of Python caches.
+Use a fresh build directory for a release.
 
 ## What the installer does
 
@@ -33,7 +39,8 @@ program of 4 GiB or more, so a larger build comes as the program plus a `.data` 
 - **Licence page:** shows `LICENSE-NOTICE.txt` and installs only after "I accept".
 - **Per user, no administrator rights:** `%LOCALAPPDATA%\Programs\MyTranscribe Medical`, desktop
   and Start-menu shortcuts, an entry in Settings → Apps. Updating keeps the user's settings.
-- **Switches:** `/S` (silent; accepts the licence), `/D=<folder>`, `/noshortcuts`. Uninstall:
+- **Switches:** `/S` (silent; accepts the licence), `/D=<folder>` (default: the installed copy's
+  folder), `/noshortcuts`. Uninstall:
   `"<folder>\Uninstall MyTranscribe.exe" /uninstall [/S]`. Log: `%TEMP%\MyTranscribe-setup.log`.
 
 ## What goes in
@@ -50,6 +57,10 @@ program of 4 GiB or more, so a larger build comes as the program plus a `.data` 
 
 - **Self-test:** `<install>\python\python.exe <install>\selftest.py` checks imports, the hardware,
   the model and a decode; with an NVIDIA card it also checks that cuBLAS loads from the install.
+- **Release checks:** exercise the final download on a disposable Windows profile or VM as a
+  standard user, record a local antivirus result, and publish the SHA-256 of the exact file
+  offered. If adding an Authenticode signature, check payload detection on the signed artifact:
+  the current format reads a trailer at the end of the file.
 - **Processor path on an NVIDIA PC:** set `CUDA_VISIBLE_DEVICES=-1`.
 - **Do not test the real installer on a PC with a real install of the same build:** both use one
   Apps entry, and uninstalling a test copy removes it. Compile a copy of `Setup.cs` with another

@@ -21,7 +21,7 @@
 // goes wrong) and leaves Python, the packages, the speech model and the shortcuts as they are.
 //
 // Switches (for scripted tests and managed installs): /S silent (which accepts the licence terms in
-// LICENSE-NOTICE.txt), /D=<folder>, /noshortcuts, /uninstall. Windows 11 only (Requirements).
+// LICENSE-NOTICE.txt), /D=<folder> (default: the installed copy's folder), /noshortcuts, /uninstall. Windows 11 only (Requirements).
 
 using System;
 using System.Collections.Generic;
@@ -383,8 +383,10 @@ static class Installer
                 Log.Write("updated " + target + " to " + p.Version);
                 return 0;
             }
-            Install(p, o.Folder ?? Program.DefaultFolder(), !o.NoShortcuts, null);
-            Log.Write("installed to " + (o.Folder ?? Program.DefaultFolder()));
+            // Like the window: the installed copy's folder unless /D names another.
+            string folder = o.Folder ?? Program.InstalledFolder() ?? Program.DefaultFolder();
+            Install(p, folder, !o.NoShortcuts, null);
+            Log.Write("installed to " + folder);
             return 0;
         }
         catch (Exception ex)
@@ -415,48 +417,160 @@ static class Installer
                "MyTranscribe Medical, which this installer leaves as it is. Please choose another folder.";
     }
 
-    // progress(done bytes, total bytes)
+    // Installation state (including the Apps entry) is shared by all setup processes: one runs at
+    // a time for each Windows account, whichever edition, so it may tidy what another left.
+    public static T Exclusive<T>(Func<T> action)
+    {
+        string user = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
+        using (var gate = new Mutex(false, "Local\\MyTranscribe-Setup-" + user))
+        {
+            try
+            {
+                if (!gate.WaitOne(0)) throw new IOException("Another setup is running. Try again after it finishes.");
+            }
+            catch (AbandonedMutexException) { } // The OS granted this process ownership.
+            try { return action(); }
+            finally { gate.ReleaseMutex(); }
+        }
+    }
+
+    static string SafeFolder(string path)
+    {
+        string folder = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
+        if (folder.Length <= Path.GetPathRoot(Path.GetFullPath(path)).Length)
+            throw new IOException("Choose a dedicated application folder.");
+        for (var dir = new DirectoryInfo(folder); dir != null; dir = dir.Parent)
+            if (dir.Exists && (dir.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Choose a folder without redirected directories: " + dir.FullName);
+        return folder;
+    }
+
+    public static bool OwnsInstallation(string folder)
+    {
+        string registered = Program.InstalledFolder();
+        return registered != null &&
+               String.Equals(SafeFolder(registered), SafeFolder(folder), StringComparison.OrdinalIgnoreCase) &&
+               HasInstallFiles(folder);
+    }
+
+    static bool HasInstallFiles(string folder)
+    {
+        return File.Exists(Path.Combine(folder, "build_info.json")) &&
+               File.Exists(Path.Combine(folder, Program.UninstallExe)) &&
+               File.Exists(Path.Combine(folder, "python", "python.exe"));
+    }
+
+    public static void CheckTree(string root)
+    {
+        foreach (var entry in new DirectoryInfo(root).EnumerateFileSystemInfos())
+        {
+            if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Unexpected redirected file or directory: " + entry.FullName);
+            if ((entry.Attributes & FileAttributes.Directory) != 0) CheckTree(entry.FullName);
+        }
+    }
+
     public static void Install(Payload p, string folder, bool shortcuts, Action<long, long> progress)
     {
+        Exclusive(() => { InstallLocked(p, folder, shortcuts, progress); return true; });
+    }
+
+    // A setup that was stopped (killed, power cut) leaves "<folder>.stage-<id>" (a partly unpacked
+    // copy) or "<folder>.backup-<id>" (what it set aside) beside the install. Put back a copy set
+    // aside just before the swap, and anything an update had taken out and not yet replaced, then
+    // remove the rest. With restore false (uninstalling), remove them all.
+    public static void Tidy(string folder, bool restore)
+    {
+        string parent = Path.GetDirectoryName(folder), name = Path.GetFileName(folder);
+        if (!Directory.Exists(parent)) return;
+        foreach (var dir in new DirectoryInfo(parent).GetDirectories(name + ".*").OrderByDescending(d => d.CreationTimeUtc))
+        {
+            string kind = LeftoverKind(name, dir.Name);
+            if (kind == null || (dir.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+            try
+            {
+                CheckTree(dir.FullName);
+                if (restore && kind == "backup")
+                {
+                    if (!Directory.Exists(folder) && HasInstallFiles(dir.FullName))
+                    {
+                        Directory.Move(dir.FullName, folder);
+                        Log.Write("restored " + folder + " from " + dir.Name);
+                        continue;
+                    }
+                    if (Directory.Exists(folder) && !HasInstallFiles(dir.FullName))
+                        foreach (var entry in dir.GetFileSystemInfos())
+                        {
+                            string target = Path.Combine(folder, entry.Name);
+                            if (!Directory.Exists(target) && !File.Exists(target)) MoveEntry(entry.FullName, target);
+                        }
+                }
+                TryDelete(dir.FullName);
+                Log.Write("removed " + dir.Name + ", left by an interrupted setup");
+            }
+            catch (Exception ex) { Log.Write("could not tidy " + dir.FullName + ": " + ex.Message); }
+        }
+    }
+
+    // "stage" or "backup" for a folder this program names "<name>.<kind>-<32 hex digits>", else null.
+    static string LeftoverKind(string name, string candidate)
+    {
+        foreach (var kind in new[] { "stage", "backup" })
+        {
+            string prefix = name + "." + kind + "-";
+            if (candidate.Length == prefix.Length + 32 &&
+                candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                candidate.Substring(prefix.Length).All(Uri.IsHexDigit))
+                return kind;
+        }
+        return null;
+    }
+
+    static void InstallLocked(Payload p, string folder, bool shortcuts, Action<long, long> progress)
+    {
+        folder = SafeFolder(folder);
+        Tidy(folder, true);
         string other = OtherEdition(p, folder);
         if (other != null) throw new InvalidOperationException(other);
-        string parent = Path.GetDirectoryName(folder);
-        Directory.CreateDirectory(parent);
-        string old = folder + ".old";
-        if (Directory.Exists(old)) TryDelete(old);
-
-        // An earlier version is set aside first (it is idle, so renaming it is reliable; a copy
-        // that is still running keeps its files locked), and put back if anything goes wrong.
-        if (Directory.Exists(folder))
+        bool existing = Directory.Exists(folder);
+        bool upgrading = existing && OwnsInstallation(folder);
+        if (existing)
         {
-            bool moved = false;
-            for (int i = 0; i < 4 && !moved; i++)
-            {
-                try { Directory.Move(folder, old); moved = true; }
-                catch (IOException) { Thread.Sleep(500); }
-                catch (UnauthorizedAccessException) { Thread.Sleep(500); }
-            }
-            if (!moved)
-                throw new IOException(Program.AppName + " is still running. Close it (the window, and the " +
-                                      "icon by the clock if there is one), then try again.");
+            if (!upgrading && Directory.EnumerateFileSystemEntries(folder).Any())
+                throw new IOException("This folder already contains files. Choose an empty folder: " + folder);
+            CheckTree(folder);
+            if (Running(folder)) throw new IOException("Close MyTranscribe before installing.");
         }
+        string stage = folder + ".stage-" + Guid.NewGuid().ToString("N");
+        string backup = folder + ".backup-" + Guid.NewGuid().ToString("N");
+        bool moved = false, installed = false;
         try
         {
-            Extract(p, folder, progress);
+            Extract(p, stage, progress);
+            if (existing)
+            {
+                Directory.Move(folder, backup);
+                moved = true;
+                // Extraction may take minutes. Check what was actually set aside
+                // before committing to replace it or removing any of its contents.
+                SafeFolder(backup);
+                if (upgrading ? !HasInstallFiles(backup) : Directory.EnumerateFileSystemEntries(backup).Any())
+                    throw new IOException("The destination changed during setup. Its files have been preserved.");
+                CheckTree(backup);
+            }
+            Directory.Move(stage, folder);
+            installed = true;
+            if (shortcuts) Shortcuts.Create(folder);
+            Register(folder, p);
         }
-        catch (Exception)
+        catch
         {
-            TryDelete(folder);
-            if (Directory.Exists(old) && !Directory.Exists(folder)) Directory.Move(old, folder);
+            if (installed) Directory.Move(folder, stage);
+            if (moved) Directory.Move(backup, folder);
             throw;
         }
-        if (Directory.Exists(old)) TryDelete(old);
-
-        if (shortcuts)
-        {
-            Shortcuts.Create(folder);
-        }
-        Register(folder, p);
+        finally { TryDelete(stage); }
+        if (moved) TryDelete(backup);
     }
 
     // Why an update package cannot be applied to folder, or null if it can.
@@ -497,51 +611,82 @@ static class Installer
     // beside it; Python, the packages, the model and the shortcuts stay as they are.
     public static void Update(Payload p, string folder, Action<long, long> progress)
     {
+        Exclusive(() => { UpdateLocked(p, folder, progress); return true; });
+    }
+
+    static void UpdateLocked(Payload p, string folder, Action<long, long> progress)
+    {
+        folder = SafeFolder(folder);
+        Tidy(folder, true);
         string problem = UpdateProblem(p, folder);
         if (problem != null) throw new InvalidOperationException(problem);
         if (Running(folder))
             throw new IOException(Program.AppName + " is still running. Close it (the window, and the " +
                                   "icon by the clock if there is one), then try again.");
-        string src = Path.Combine(folder, "src"), old = src + ".old";
-        if (Directory.Exists(old)) TryDelete(old);
-        for (int i = 0; Directory.Exists(src); i++)
-        {
-            try { Directory.Move(src, old); }
-            catch (IOException) { if (i >= 3) throw; Thread.Sleep(500); }
-            catch (UnauthorizedAccessException) { if (i >= 3) throw; Thread.Sleep(500); }
-        }
+        if (!OwnsInstallation(folder)) throw new IOException("The update needs a registered installation.");
+        CheckTree(folder);
+        string stage = folder + ".stage-" + Guid.NewGuid().ToString("N");
+        string backup = folder + ".backup-" + Guid.NewGuid().ToString("N");
+        var saved = new List<string>();
+        var placed = new List<string>();
         try
         {
-            Extract(p, folder, progress);
+            Extract(p, stage, progress);
+            Directory.CreateDirectory(backup);
+            foreach (var entry in new DirectoryInfo(stage).GetFileSystemInfos())
+            {
+                string name = entry.Name;
+                if (!new[] { "src", "selftest.py", "build_info.json", "LICENSE.txt", "NOTICE.md",
+                             "LICENSE-NOTICE.txt", Program.UninstallExe }.Contains(name))
+                    throw new IOException("Unexpected update component: " + name);
+                string target = Path.Combine(folder, name);
+                if (Directory.Exists(target) || File.Exists(target))
+                {
+                    MoveEntry(target, Path.Combine(backup, name));
+                    saved.Add(name);
+                }
+                MoveEntry(entry.FullName, target);
+                placed.Add(name);
+            }
+            using (var key = Registry.CurrentUser.OpenSubKey(Program.RegKey, true))
+                key.SetValue("DisplayVersion", p.Version);
         }
-        catch (Exception)
+        catch
         {
-            TryDelete(src);
-            if (Directory.Exists(old) && !Directory.Exists(src)) Directory.Move(old, src);
+            foreach (var name in placed) MoveEntry(Path.Combine(folder, name), Path.Combine(stage, name));
+            foreach (var name in saved) MoveEntry(Path.Combine(backup, name), Path.Combine(folder, name));
             throw;
         }
-        TryDelete(old);
-        using (var key = Registry.CurrentUser.OpenSubKey(Program.RegKey, true))
-            if (key != null) key.SetValue("DisplayVersion", p.Version);
+        finally { TryDelete(stage); }
+        TryDelete(backup);
+    }
+
+    static void MoveEntry(string source, string target)
+    {
+        if (Directory.Exists(source)) Directory.Move(source, target);
+        else File.Move(source, target);
     }
 
     static void Extract(Payload p, string folder, Action<long, long> progress)
     {
         Directory.CreateDirectory(folder);
-        string root = Path.GetFullPath(folder);
+        string root = Path.GetFullPath(folder) + Path.DirectorySeparatorChar;
         long done = 0;
         var buffer = new byte[1 << 20];
         using (var zip = p.OpenZip())
         {
             foreach (var e in zip.Entries)
             {
+                if (Path.IsPathRooted(e.FullName) || e.FullName.Contains(":") ||
+                    e.FullName.Split('/', '\\').Any(part => part == "." || part == ".."))
+                    throw new IOException("Invalid archive entry.");
                 string target = Path.GetFullPath(Path.Combine(folder, e.FullName));
                 if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("Unexpected file in the installer: " + e.FullName);
                 if (e.FullName.EndsWith("/")) { Directory.CreateDirectory(target); continue; }
                 Directory.CreateDirectory(Path.GetDirectoryName(target));
                 using (var input = e.Open())
-                using (var output = File.Create(target))
+                using (var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
                     int n;
                     while ((n = input.Read(buffer, 0, buffer.Length)) > 0)
@@ -881,7 +1026,12 @@ static class Uninstaller
                 removeData = f.RemoveData;
             }
         }
-        if (!File.Exists(Path.Combine(folder, "build_info.json")) || !File.Exists(Path.Combine(folder, Program.UninstallExe)))
+        return Installer.Exclusive(() => Remove(folder, self, o, removeData));
+    }
+
+    static int Remove(string folder, string self, Options o, bool removeData)
+    {
+        if (!Installer.OwnsInstallation(folder))
         {
             Ui.Error("This does not look like a MyTranscribe folder, so nothing was removed: " + folder, o);
             ScheduleDelete(self);
@@ -889,10 +1039,12 @@ static class Uninstaller
         }
         try
         {
+            Installer.CheckTree(folder);
             Shortcuts.Remove();
             Installer.TryDelete(folder);
             if (Directory.Exists(folder))
                 throw new IOException(Program.AppName + " is still running. Close it, then uninstall again.");
+            Installer.Tidy(folder, false);
             Registry.CurrentUser.DeleteSubKeyTree(Program.RegKey, false);
             if (removeData)
             {
