@@ -447,7 +447,12 @@ static class Installer
         string registered = Program.InstalledFolder();
         return registered != null &&
                String.Equals(SafeFolder(registered), SafeFolder(folder), StringComparison.OrdinalIgnoreCase) &&
-               File.Exists(Path.Combine(folder, "build_info.json")) &&
+               HasInstallFiles(folder);
+    }
+
+    static bool HasInstallFiles(string folder)
+    {
+        return File.Exists(Path.Combine(folder, "build_info.json")) &&
                File.Exists(Path.Combine(folder, Program.UninstallExe)) &&
                File.Exists(Path.Combine(folder, "python", "python.exe"));
     }
@@ -473,9 +478,10 @@ static class Installer
         string other = OtherEdition(p, folder);
         if (other != null) throw new InvalidOperationException(other);
         bool existing = Directory.Exists(folder);
+        bool upgrading = existing && OwnsInstallation(folder);
         if (existing)
         {
-            if (!OwnsInstallation(folder) && Directory.EnumerateFileSystemEntries(folder).Any())
+            if (!upgrading && Directory.EnumerateFileSystemEntries(folder).Any())
                 throw new IOException("This folder already contains files. Choose an empty folder: " + folder);
             CheckTree(folder);
             if (Running(folder)) throw new IOException("Close MyTranscribe before installing.");
@@ -486,7 +492,17 @@ static class Installer
         try
         {
             Extract(p, stage, progress);
-            if (existing) { Directory.Move(folder, backup); moved = true; }
+            if (existing)
+            {
+                Directory.Move(folder, backup);
+                moved = true;
+                // Extraction may take minutes. Check what was actually set aside
+                // before committing to replace it or removing any of its contents.
+                SafeFolder(backup);
+                if (upgrading ? !HasInstallFiles(backup) : Directory.EnumerateFileSystemEntries(backup).Any())
+                    throw new IOException("The destination changed during setup. Its files have been preserved.");
+                CheckTree(backup);
+            }
             Directory.Move(stage, folder);
             installed = true;
             if (shortcuts) Shortcuts.Create(folder);
