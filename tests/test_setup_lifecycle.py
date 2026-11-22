@@ -29,7 +29,7 @@ def test_scratch_install_replace_update_and_remove(tmp_path):
         subprocess.run([*cmd[:-1], str(scratch)], check=check)
     stub = bi.compile_stub(tmp_path, bi.REPO / "src/assets/mytranscribe.ico", run=compile_scratch)
     dest = tmp_path / "app"
-    backup = tmp_path / "app.old"
+    backup = tmp_path / "app.backup-mine"  # looks like a setup leftover, but is not one
     backup.mkdir()
     marker = backup / "keep.txt"
     marker.write_text("unrelated")
@@ -53,7 +53,12 @@ def test_scratch_install_replace_update_and_remove(tmp_path):
         user_file.unlink()
         assert run_fixture("1") == 0
         assert run_fixture("2") == 0
-        assert run_fixture("3", "update") == 0
+        # A setup stopped part-way leaves a partly unpacked copy, and may have set the installed
+        # copy aside just before the swap: the next setup puts that copy back and removes the rest.
+        leftovers = lambda: list(tmp_path.glob("app.stage-*")) + list(tmp_path.glob("app.backup-" + "?" * 32))
+        (tmp_path / f"app.stage-{uuid.uuid4().hex}" / "src").mkdir(parents=True)
+        dest.rename(tmp_path / f"app.backup-{uuid.uuid4().hex}")
+        assert run_fixture("3", "update") == 0 and not leftovers()
         assert (dest / "src/version.txt").read_text() == "3"
         # An open installed file prevents replacement; the prior version must survive.
         with (dest / "build_info.json").open("rb"):
@@ -61,11 +66,18 @@ def test_scratch_install_replace_update_and_remove(tmp_path):
         assert (dest / "src/version.txt").read_text() == "3"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as handle:
             assert winreg.QueryValueEx(handle, "DisplayVersion")[0] == "3"
+        # An update stopped after setting a file aside and before putting the new one in.
+        aside = tmp_path / f"app.backup-{uuid.uuid4().hex}"
+        aside.mkdir()
+        (aside / "selftest.py").write_text("set aside")
+        assert run_fixture("5", "update") == 0 and not leftovers()
+        assert (dest / "selftest.py").read_text() == "set aside"
+        (tmp_path / f"app.stage-{uuid.uuid4().hex}").mkdir()
         # Use a scratch helper from outside the target so the removal runs synchronously.
         helper = tmp_path / "scratch-remove.exe"
         helper.write_bytes(stub.read_bytes())
         subprocess.run([helper, "/uninstall", "/S", f"/from={dest}"], check=True, timeout=30)
-        assert not dest.exists() and marker.read_text() == "unrelated"
+        assert not dest.exists() and not leftovers() and marker.read_text() == "unrelated"
     finally:
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)

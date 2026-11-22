@@ -415,11 +415,12 @@ static class Installer
                "MyTranscribe Medical, which this installer leaves as it is. Please choose another folder.";
     }
 
-    // Installation state (including the Apps entry) is shared by all setup processes.
+    // Installation state (including the Apps entry) is shared by all setup processes: one runs at
+    // a time for each Windows account, whichever edition, so it may tidy what another left.
     public static T Exclusive<T>(Func<T> action)
     {
         string user = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
-        using (var gate = new Mutex(false, "Local\\MyTranscribe-Setup-" + user + "-" + Program.Device))
+        using (var gate = new Mutex(false, "Local\\MyTranscribe-Setup-" + user))
         {
             try
             {
@@ -472,9 +473,61 @@ static class Installer
         Exclusive(() => { InstallLocked(p, folder, shortcuts, progress); return true; });
     }
 
+    // A setup that was stopped (killed, power cut) leaves "<folder>.stage-<id>" (a partly unpacked
+    // copy) or "<folder>.backup-<id>" (what it set aside) beside the install. Put back a copy set
+    // aside just before the swap, and anything an update had taken out and not yet replaced, then
+    // remove the rest. With restore false (uninstalling), remove them all.
+    public static void Tidy(string folder, bool restore)
+    {
+        string parent = Path.GetDirectoryName(folder), name = Path.GetFileName(folder);
+        if (!Directory.Exists(parent)) return;
+        foreach (var dir in new DirectoryInfo(parent).GetDirectories(name + ".*").OrderByDescending(d => d.CreationTimeUtc))
+        {
+            string kind = LeftoverKind(name, dir.Name);
+            if (kind == null || (dir.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+            try
+            {
+                CheckTree(dir.FullName);
+                if (restore && kind == "backup")
+                {
+                    if (!Directory.Exists(folder) && HasInstallFiles(dir.FullName))
+                    {
+                        Directory.Move(dir.FullName, folder);
+                        Log.Write("restored " + folder + " from " + dir.Name);
+                        continue;
+                    }
+                    if (Directory.Exists(folder) && !HasInstallFiles(dir.FullName))
+                        foreach (var entry in dir.GetFileSystemInfos())
+                        {
+                            string target = Path.Combine(folder, entry.Name);
+                            if (!Directory.Exists(target) && !File.Exists(target)) MoveEntry(entry.FullName, target);
+                        }
+                }
+                TryDelete(dir.FullName);
+                Log.Write("removed " + dir.Name + ", left by an interrupted setup");
+            }
+            catch (Exception ex) { Log.Write("could not tidy " + dir.FullName + ": " + ex.Message); }
+        }
+    }
+
+    // "stage" or "backup" for a folder this program names "<name>.<kind>-<32 hex digits>", else null.
+    static string LeftoverKind(string name, string candidate)
+    {
+        foreach (var kind in new[] { "stage", "backup" })
+        {
+            string prefix = name + "." + kind + "-";
+            if (candidate.Length == prefix.Length + 32 &&
+                candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                candidate.Substring(prefix.Length).All(Uri.IsHexDigit))
+                return kind;
+        }
+        return null;
+    }
+
     static void InstallLocked(Payload p, string folder, bool shortcuts, Action<long, long> progress)
     {
         folder = SafeFolder(folder);
+        Tidy(folder, true);
         string other = OtherEdition(p, folder);
         if (other != null) throw new InvalidOperationException(other);
         bool existing = Directory.Exists(folder);
@@ -561,12 +614,13 @@ static class Installer
 
     static void UpdateLocked(Payload p, string folder, Action<long, long> progress)
     {
+        folder = SafeFolder(folder);
+        Tidy(folder, true);
         string problem = UpdateProblem(p, folder);
         if (problem != null) throw new InvalidOperationException(problem);
         if (Running(folder))
             throw new IOException(Program.AppName + " is still running. Close it (the window, and the " +
                                   "icon by the clock if there is one), then try again.");
-        folder = SafeFolder(folder);
         if (!OwnsInstallation(folder)) throw new IOException("The update needs a registered installation.");
         CheckTree(folder);
         string stage = folder + ".stage-" + Guid.NewGuid().ToString("N");
@@ -988,6 +1042,7 @@ static class Uninstaller
             Installer.TryDelete(folder);
             if (Directory.Exists(folder))
                 throw new IOException(Program.AppName + " is still running. Close it, then uninstall again.");
+            Installer.Tidy(folder, false);
             Registry.CurrentUser.DeleteSubKeyTree(Program.RegKey, false);
             if (removeData)
             {
