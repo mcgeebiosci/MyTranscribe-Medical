@@ -1,0 +1,263 @@
+"""
+text_fixes.py — small deterministic clean-ups applied to every transcribed chunk.
+
+1. Spelled-out abbreviations. Whisper writes letter-by-letter dictation as
+   "H-E-E-N-T" or "C, V, A". Hyphen-joined single letters are always joined
+   ("H-E-E-N-T" -> "HEENT"). Space/comma-separated letters are joined only when
+   the result is a known abbreviation from the vocabulary, so a real list like
+   "A, B, C" is left alone.
+
+2. Personal corrections ("heard => correct"), like a dictation vocabulary editor:
+   one rule per line in plain-text files; whole words/phrases, case-insensitive.
+     anti-Rho => anti-Ro
+   Bundled file: vocab/corrections.txt. Your own: %APPDATA%\\MyTranscribe\\corrections.txt
+   (or $MYTRANSCRIBE_CORRECTIONS_FILE). Lines starting with # are comments.
+
+Pure functions; nothing is logged.
+"""
+
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Callable, Iterable, List, Optional, Set, Tuple
+
+BUNDLED_CORRECTIONS = Path(__file__).parent / "vocab" / "corrections.txt"
+
+_HYPHEN_LETTERS = re.compile(r"\b(?:[A-Za-z]-){1,9}[A-Za-z]\b")
+_SPACED_LETTERS = re.compile(r"\b(?:[A-Za-z][.,]?\s+){1,9}[A-Za-z]\b\.?")
+
+
+def join_spelled_letters(text: str, known: Set[str] = frozenset()) -> str:
+    """'H-E-E-N-T' -> 'HEENT' always; 'C, V, A' -> 'CVA' only if 'CVA' is a known abbreviation."""
+    def hyphen(m):
+        return m.group(0).replace("-", "").upper()
+
+    def spaced(m):
+        letters = re.findall(r"[A-Za-z]", m.group(0))
+        joined = "".join(letters).upper()
+        if len(letters) >= 2 and joined.lower() in known:
+            # Keep a final "." only where a sentence really ends (text end, or a capital next).
+            rest = m.string[m.end():]
+            ends_sentence = m.group(0).endswith(".") and (not rest.strip() or re.match(r"\s+[A-Z\n]", rest))
+            return joined + ("." if ends_sentence else "")
+        return m.group(0)
+    text = _HYPHEN_LETTERS.sub(hyphen, text)
+    return _SPACED_LETTERS.sub(spaced, text)
+
+
+def default_user_corrections_path() -> Path:
+    env = os.environ.get("MYTRANSCRIBE_CORRECTIONS_FILE", "").strip()
+    if env:
+        return Path(env)
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return base / "MyTranscribe" / "corrections.txt"
+    return Path.home() / ".config" / "mytranscribe" / "corrections.txt"
+
+
+def load_corrections(paths: Iterable[Path]) -> List[Tuple[re.Pattern, str]]:
+    """Parse 'heard => correct' rules; later files win for the same 'heard'."""
+    rules = {}
+    for path in paths:
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=>" not in line:
+                continue
+            heard, correct = (s.strip() for s in line.split("=>", 1))
+            if heard and correct:
+                rules[heard.lower()] = correct
+    out = []
+    for heard, correct in sorted(rules.items(), key=lambda kv: -len(kv[0])):   # longest first
+        words = [re.escape(w) for w in re.split(r"[\s-]+", heard)]
+        pat = re.compile(r"(?<![\w-])" + r"[\s-]+".join(words) + r"(?![\w-])", re.IGNORECASE)
+        out.append((pat, correct))
+    return out
+
+
+def apply_corrections(text: str, rules: List[Tuple[re.Pattern, str]]) -> str:
+    def keep_capital(m, correct):
+        # "medications is below => medications as below": when the rule keeps the first word,
+        # that word keeps the capital it had in the text. A rule that changes the first word
+        # ("C attached => see attached", "anti-Rho => anti-Ro") is written exactly as given.
+        same_first = m.group(0).split()[0].lower() == correct.split()[0].lower() if correct.split() else False
+        if same_first and m.group(0)[:1].isupper() and correct[:1].islower():
+            return correct[0].upper() + correct[1:]
+        return correct
+    for pat, correct in rules:
+        text = pat.sub(lambda m, c=correct: keep_capital(m, c), text)
+    return text
+
+
+# -- Readings: "138 over 78" -> 138/78, "g per litre" -> g/L, "degrees Celsius" -> °C --
+_UNIT = {"g": "g", "gram": "g", "grams": "g", "mg": "mg", "milligram": "mg", "milligrams": "mg",
+         "mcg": "mcg", "microgram": "mcg", "micrograms": "mcg", "µg": "µg", "μg": "µg",
+         "kg": "kg", "kilogram": "kg", "kilograms": "kg",
+         "mmol": "mmol", "millimole": "mmol", "millimoles": "mmol",
+         "µmol": "µmol", "μmol": "µmol", "micromole": "µmol", "micromoles": "µmol",
+         "nmol": "nmol", "pmol": "pmol", "ml": "mL", "millilitre": "mL", "millilitres": "mL",
+         "milliliter": "mL", "milliliters": "mL", "iu": "IU", "units": "units", "unit": "units",
+         "meq": "mEq", "ng": "ng", "pg": "pg"}
+_PER = {"l": "L", "litre": "L", "liter": "L", "dl": "dL", "decilitre": "dL", "deciliter": "dL",
+        "ml": "mL", "millilitre": "mL", "milliliter": "mL", "kg": "kg", "kilogram": "kg",
+        "hour": "h", "day": "day", "minute": "min", "min": "min"}
+_NUMBER = r"\d+(?:\.\d+)?"
+_UNIT_PER = re.compile(r"(?<![\w/])(" + _NUMBER + r")\s?(" + "|".join(sorted(_UNIT, key=len, reverse=True))
+                       + r")\s+per\s+(" + "|".join(sorted(_PER, key=len, reverse=True)) + r")(?![\w/])", re.I)
+_OVER = re.compile(r"(?<![\w./])(\d{2,3})\s+over\s+(\d{2,3})(?!\w|[./]\d|\s+(?:the|a|an)\b)", re.I)
+_DEGREES = re.compile(r"(?<![\w.])(" + _NUMBER + r")\s*(?:degrees?|°)\s*(celsius|centigrade|fahrenheit|c|f)(?!\w)", re.I)
+
+
+_ID_WOULD = re.compile(r"\b(I|we|he|she|they)['’]d(?=\s+(?:be|appreciate|like|suggest|recommend|value|welcome|"
+                       r"advise|favou?r|consider|expect|prefer|also)\b)", re.I)
+_S_HAS = re.compile(r"\b(there|it|he|she|that|here)['’]s(?=\s+(?:been|had|got)\b)", re.I)
+_S_IS = re.compile(r"\b(there|it|he|she|that|here)['’]s(?=\s+(?:a|an|the|no|not|also|now|currently|on|in|at|"
+                   r"likely|unlikely|possible|\w+ing)\b)", re.I)
+
+
+# -- Hesitations: "um", "uh" are never meant to be written --------------------------------
+# "er" and "ah" only in lower case or before a comma ("ER" is the emergency room); "mm" is
+# millimetres, so it is not a hesitation here.
+_FILLER = re.compile(r"(,?)[ \t]*(?<![\w'’-])(?:(?i:u+[hm]+|erm+|hmm+)|er|ah|(?:Er|Ah)(?=,))(?![\w'’-])"
+                     r"([,.;:?!…]*)[ \t]*")
+_LOWER_WORD = re.compile(r"^(\s*)([a-z])(?=[a-z']*\b)")
+
+
+def remove_fillers(text: str) -> str:
+    """
+    "with, um, 2 months" -> "with 2 months"; "Um, the chest is clear" -> "The chest is clear";
+    "drinks, uh." -> "drinks.". The commas around a hesitation were only there for the pause.
+    """
+    out, pos, cap = "", 0, False
+    for m in _FILLER.finditer(text):
+        piece = text[pos:m.start()]
+        if cap and piece:
+            piece, cap = _LOWER_WORD.sub(lambda x: x.group(1) + x.group(2).upper(), piece, 1), False
+        head = (out + piece).rstrip(" \t")
+        rest = text[m.end():]
+        joiner = " " if rest and not rest.startswith("\n") else ""
+        at_start = not head or head[-1] in ".!?\n"
+        end = re.search(r"[.?!…]", m.group(2))
+        if at_start:
+            out = head + (" " if head and not head.endswith("\n") and rest else "")
+            cap = True
+        elif end:
+            out = head + end.group(0) + joiner
+        else:
+            keep = m.group(2) if m.group(2) in (";", ":") else ""
+            out = head + keep + joiner
+        pos = m.end()
+    tail = text[pos:]
+    if cap:
+        tail = _LOWER_WORD.sub(lambda x: x.group(1) + x.group(2).upper(), tail, 1)
+    return out + tail
+
+
+# -- Self-corrections: "20 mg, sorry, 15 mg" -> "15 mg" -------------------------------------
+# Only when what was said and what replaced it are the same kind of thing (an amount, a spinal
+# level or similar code, a side, a day), so "sorry" in ordinary speech is never touched.
+_CUE = r"(?i:sorry|I mean|correction|or rather)"
+_AMOUNT_UNIT = r"(?:mg|mcg|g|kg|mL|L|units?|mmol/L|mEq|puffs?|tablets?)\b|%"
+_KINDS = (
+    (r"\d{2,3}/\d{2,3}", ""),                                          # a blood pressure
+    (r"\d+(?:\.\d+)?", r"(?:[ \t]?(?:" + _AMOUNT_UNIT + r"))?"),       # an amount, with or without its unit
+    (r"[A-Z]{1,2}\d{1,2}(?:-[A-Z]?\d{1,2})?", ""),                     # a spinal level or similar code
+    (r"(?i:left|right)", ""),
+    (r"(?i:monday|tuesday|wednesday|thursday|friday|saturday|sunday)", ""),
+)
+_SELF_CORRECTIONS = [re.compile(r"(?<![\w./-])(" + core + r")(" + unit + r")[,.]?[ \t]+" + _CUE + r"[,.]?[ \t]+("
+                                + core + r")(" + unit + r")(?![\w/])") for core, unit in _KINDS]
+
+
+def apply_self_corrections(text: str) -> str:
+    """'prednisone 20 mg, sorry, 15 mg daily' -> 'prednisone 15 mg daily'; 'L4-5, sorry, L5-S1' -> 'L5-S1'."""
+    for pat in _SELF_CORRECTIONS:
+        # A unit said only the first time carries over: "20 mg, sorry, 15 daily" -> "15 mg daily".
+        text = pat.sub(lambda m: m.group(3) + (m.group(4) or m.group(2)), text)
+    return text
+
+
+# -- Signs and units as they are written: "minus 3.1" -> "-3.1", "1 gram" -> "1 g" ------------
+_MINUS = re.compile(r"\b[Mm]inus[ \t]+(?=\d)")
+_NOT_A_SIGN = re.compile(r"(?:\d|\b(?:or|and|plus))[ \t]*$", re.I)     # "5 minus 3", "plus or minus 2"
+_UNIT_WORD = re.compile(r"(?<![\w./])(\d+(?:\.\d+)?)[ \t]+(grams?|kilograms?|milligrams?|micrograms?|"
+                        r"millilit(?:re|er)s?|lit(?:re|er)s?)(?![\w/])", re.I)
+_UNIT_SYMBOL = {"gram": "g", "kilogram": "kg", "milligram": "mg", "microgram": "mcg",
+                "millilitre": "mL", "milliliter": "mL", "litre": "L", "liter": "L"}
+
+
+def write_signs_and_units(text: str) -> str:
+    text = _MINUS.sub(lambda m: m.group(0) if _NOT_A_SIGN.search(m.string[:m.start()]) else "-", text)
+    return _UNIT_WORD.sub(lambda m: f"{m.group(1)} {_UNIT_SYMBOL[m.group(2).lower().rstrip('s')]}", text)
+
+
+_HAVE = re.compile(r"\b(I|we|they|you)['’]ve\b", re.I)
+_PACK_YEAR = re.compile(r"\b(\d+)[- ]pack[- ]year\b(?!s)", re.I)
+# The kidney function is written eGFR; "EGFR" (the gene) is never followed by a value.
+_EGFR = re.compile(r"\bEGFR(?=\s+(?:is|was|of|at|=|has|had|now|today|down|up)?\s*(?:\d|>|<))")
+
+
+def expand_contractions(text: str) -> str:
+    """
+    A letter dictated as "I would be grateful" or "There is no history" is
+    sometimes written "I'd be grateful", "There's no history". Only the forms
+    whose meaning is certain from the next word are written out; "didn't" and
+    the like are left as said.
+    """
+    text = _HAVE.sub(lambda m: m.group(1) + " have", text)          # "I've" is always "I have"
+    text = _ID_WOULD.sub(lambda m: m.group(1) + " would", text)
+    text = _S_HAS.sub(lambda m: m.group(1) + " has", text)
+    return _S_IS.sub(lambda m: m.group(1) + " is", text)
+
+
+def format_readings(text: str, classical: bool = False) -> str:
+    """
+    Readings as they are written in a chart: "138 over 78" -> "138/78" (two 2-3
+    digit numbers), "124 g per litre" -> "124 g/L", "37.2 degrees Celsius" ->
+    "37.2 °C". Only a number followed by a known unit is touched; "5 mg per day"
+    becomes "5 mg/day", "3 times per day" and "2 over the counter" are left alone.
+    """
+    import dictation_fixes
+    import drug_names
+    import spoken_numbers
+    text = dictation_fixes.apply(text)                    # spelled names, dates of birth, chart numbers
+    text = expand_contractions(text)
+    text = spoken_numbers.normalise(text)
+    text = _OVER.sub(r"\1/\2", text)
+    text = apply_self_corrections(text)                   # after the numbers and readings are written as digits
+    text = drug_names.apply(text)                         # after the numbers: a dose marks where a drug name sits
+    if classical:                                         # "Phelan's test" -> Phalen's test (classical_terms.py)
+        import classical_terms
+        text = classical_terms.apply(text)
+    text = _PACK_YEAR.sub(r"\1-pack-year", text)          # "30-pack year smoking history" -> 30-pack-year
+    text = _EGFR.sub("eGFR", text)
+    text = _UNIT_PER.sub(lambda m: f"{m.group(1)} {_UNIT[m.group(2).lower()]}/{_PER[m.group(3).lower()]}", text)
+    text = write_signs_and_units(text)
+    return _DEGREES.sub(lambda m: f"{m.group(1)} °{m.group(2)[0].upper()}", text)
+
+
+def finish(text: str, extra_fixes: bool = True, classical: bool = False) -> str:
+    """
+    Every English transcript, before spoken commands are converted: hesitations always
+    come out; the chart clean-ups above (Options → Extra corrections) when they are on, with
+    classical terms put right when `classical` (classical_terms.on_for the recogniser).
+    """
+    text = remove_fillers(text)
+    return format_readings(text, classical) if extra_fixes else text
+
+
+def make_text_fixes(known_abbreviations: Set[str],
+                    correction_files: Optional[Iterable[Path]] = None) -> Callable[[str], str]:
+    """Chunk post-processor: spelled-letter joining, then personal corrections."""
+    files = list(correction_files) if correction_files is not None else [BUNDLED_CORRECTIONS,
+                                                                          default_user_corrections_path()]
+    rules = load_corrections(files)
+    known = {a.lower() for a in known_abbreviations}
+
+    def fix(text: str) -> str:
+        return apply_corrections(join_spelled_letters(text, known), rules)
+    return fix

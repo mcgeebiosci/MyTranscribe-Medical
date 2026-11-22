@@ -1,0 +1,353 @@
+"""Recogniser registry, the Options switch, the download question and the log window."""
+
+import logging
+import sys
+import time
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+import app_log  # noqa: E402
+import engines  # noqa: E402
+from conftest import wait_for  # noqa: E402
+from fakes import FakeEngine  # noqa: E402
+from test_gui_med import make_window  # noqa: E402,F401  (fixture)
+
+
+# ── registry ────────────────────────────────────────────────────────────────
+def test_every_engine_says_where_its_model_comes_from():
+    assert engines.DEFAULT == "whisper" and set(engines.ENGINES) == {"whisper", "medasr", "parakeet", "canary"}
+    for info in engines.ENGINES.values():
+        assert info.source and info.size and info.licence and info.label
+
+
+def test_availability_reports_missing_packages_and_the_gated_model(tmp_path):
+    have = lambda name: object()                                         # noqa: E731
+    none = lambda name: None                                             # noqa: E731
+    assert engines.availability("whisper", find_spec=have) == (True, "")
+    ok, why = engines.availability("parakeet", find_spec=none)
+    assert not ok and "onnx_asr" in why
+    ok, why = engines.availability("medasr", find_spec=have, env={"MYTRANSCRIBE_MEDASR_DIR": str(tmp_path)})
+    assert not ok and "sign-in" in why
+    (tmp_path / "model.safetensors").write_bytes(b"x")
+    (tmp_path / "integrity.json").write_text("{}")
+    assert engines.availability("medasr", find_spec=have, env={"MYTRANSCRIBE_MEDASR_DIR": str(tmp_path)})[0]
+    assert engines.availability("nope") == (False, "unknown recogniser")
+
+
+def test_a_missing_model_becomes_a_question_not_a_download(monkeypatch):
+    class LocalEntryNotFoundError(Exception):
+        pass
+
+    def offline_load(name, accurate, language="en", fallback=False):
+        raise LocalEntryNotFoundError("Cannot find the requested files in the local cache")
+
+    monkeypatch.setattr(engines, "_build", offline_load)
+    monkeypatch.setattr(engines, "availability", lambda name: (True, ""))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    with pytest.raises(engines.ModelNotDownloaded) as err:
+        engines.build("whisper")
+    assert err.value.engine == "whisper"
+    seen = {}
+
+    def online_load(name, accurate, language="en", fallback=False):
+        import os
+        seen["offline"] = os.environ["HF_HUB_OFFLINE"]
+        return "engine"
+
+    monkeypatch.setattr(engines, "_build", online_load)
+    assert engines.build("whisper", allow_download=True) == "engine"
+    import os
+    assert seen["offline"] == "0" and os.environ["HF_HUB_OFFLINE"] == "1"     # offline again afterwards
+
+
+def test_accuracy_choices_are_the_large_models_this_copy_has():
+    none = lambda name: None                                             # noqa: E731
+    assert engines.accuracy_choices(none) == ["best", "fast"]            # development checkout: asks to download
+    assert engines.accuracy_choices(lambda n: "x" if n == "small.en" else None) == ["best", "fast"]   # processor build
+    assert engines.accuracy_choices(lambda n: "x" if n == "large-v3" else None) == ["best"]           # graphics-card build
+    assert engines.accuracy_choices(lambda n: "x" if n.startswith("large") else None) == ["best", "fast"]
+
+
+def test_an_installed_copy_loads_the_large_model_it_came_with(monkeypatch, tmp_path):
+    import fw_engine
+    import hw_profile
+    for var in ("MYTRANSCRIBE_MODEL", "MYTRANSCRIBE_DEVICE", "MYTRANSCRIBE_COMPUTE_TYPE"):
+        monkeypatch.delenv(var, raising=False)
+    card = hw_profile.HardwareInfo(cuda_device_count=1, gpu_name="NVIDIA GeForce RTX 4070 Ti SUPER", vram_mb=16376,
+                                   compute_capability=8.9, cuda_compute_types=frozenset({"int8_float16", "float16"}))
+    loaded = []
+
+    class Engine:
+        def __init__(self, cfg):
+            loaded.append(cfg)
+
+    monkeypatch.setattr(hw_profile, "detect_hardware", lambda: card)
+    monkeypatch.setattr(fw_engine, "register_cuda_dll_dirs", lambda: [])
+    monkeypatch.setattr(fw_engine, "FasterWhisperEngine", Engine)
+    monkeypatch.setattr(engines, "bundled_model", lambda name: tmp_path / "large-v3" if name == "large-v3" else None)
+    engines._build("whisper", accurate=False)                            # "Fast" saved earlier
+    assert (loaded[-1].model, loaded[-1].device, loaded[-1].compute_type) == (str(tmp_path / "large-v3"), "cuda",
+                                                                             "int8_float16")
+    monkeypatch.setattr(engines, "bundled_model", lambda name: None)     # development checkout: unchanged
+    engines._build("whisper", accurate=False)
+    assert loaded[-1].model == "large-v3-turbo"
+    engines._build("whisper", accurate=True)
+    assert loaded[-1].model == "large-v3"
+
+
+def test_an_unusable_engine_is_an_error_with_the_reason(monkeypatch):
+    monkeypatch.setattr(engines, "availability", lambda name: (False, "not installed: onnx_asr"))
+    with pytest.raises(RuntimeError, match="not installed: onnx_asr"):
+        engines.build("parakeet")
+
+
+# ── settings and Options ────────────────────────────────────────────────────
+def test_engine_setting_default_env_and_bad_values(tmp_path):
+    import settings as st
+    assert st.Settings().engine == "whisper"
+    assert st.Settings(engine="bogus").clean().engine == "whisper"
+    assert st.load(tmp_path / "none.json", env={"MYTRANSCRIBE_ENGINE": "medasr"}).engine == "medasr"
+
+
+def test_options_lists_engines_and_disables_unavailable_ones(qapp, monkeypatch):
+    import settings as st
+    from options_dialog import OptionsDialog
+    monkeypatch.setattr(engines, "availability",
+                        lambda name, **k: (name in ("whisper", "parakeet"), "" if name != "medasr" else "no model"))
+    monkeypatch.setattr(engines, "missing_packages", lambda name, *a: [])
+    d = OptionsDialog(st.Settings())
+    names = [d.engine.itemData(i) for i in range(d.engine.count())]
+    assert names == ["whisper", "medasr"]                   # Parakeet and Canary are trial-only
+    assert not d.engine.isHidden()
+    assert d.engine.currentData() == "whisper" and d.accuracy.isEnabled()
+    assert not d.engine.model().item(names.index("medasr")).isEnabled()
+    assert "no model" in d.engine.itemText(names.index("medasr"))
+    assert "asked before any download" in d.engine_note.text()
+    d2 = OptionsDialog(st.Settings(engine="parakeet"))      # set by MYTRANSCRIBE_ENGINE: shown, not hidden
+    assert d2.engine.currentData() == "parakeet" and not d2.accuracy.isEnabled()
+    assert "CC BY 4.0" in d2.engine_note.text()
+    assert d2.result_settings().engine == "parakeet"
+
+
+def test_recognisers_without_their_packages_are_not_offered():
+    have_all = lambda pkg: object()                           # noqa: E731
+    whisper_only = lambda pkg: object() if pkg == "faster_whisper" else None   # noqa: E731  (an installed copy)
+    assert engines.offered(find_spec=have_all) == ["whisper", "medasr"]
+    assert engines.offered(find_spec=whisper_only) == ["whisper"]
+    assert engines.offered("parakeet", find_spec=whisper_only) == ["whisper", "parakeet"]   # the current one stays
+    assert engines.offered("bogus", find_spec=whisper_only) == ["whisper"]
+    assert engines.missing_packages("medasr", whisper_only) == ["torch", "transformers"]
+
+
+def test_options_hide_the_recogniser_choice_when_only_whisper_is_installed(qapp, monkeypatch):
+    import settings as st
+    from options_dialog import OptionsDialog
+    monkeypatch.setattr(engines, "missing_packages", lambda name, *a: [] if name == "whisper" else ["torch"])
+    d = OptionsDialog(st.Settings(), devices=["Mic"], default_device="Mic")
+    assert [d.engine.itemData(i) for i in range(d.engine.count())] == ["whisper"]
+    assert d.engine.isHidden() and not d.accuracy.isHidden()
+    assert "MedASR" not in d.engine_note.text()
+    assert d.result_settings().engine == "whisper"
+
+
+def test_medasr_choice_says_the_licence_must_be_accepted(qapp, monkeypatch):
+    import settings as st
+    from options_dialog import OptionsDialog
+    monkeypatch.setattr(engines, "availability", lambda name, **k: (True, ""))
+    monkeypatch.setattr(engines, "missing_packages", lambda name, *a: [])
+    d = OptionsDialog(st.Settings())
+    d.engine.setCurrentIndex(d.engine.findData("medasr"))
+    note = d.engine_note.text()
+    assert "Licence terms must be accepted before use" in note and "huggingface.co/google/medasr" in note
+
+
+def test_options_opens_the_log_in_its_own_window(qapp):
+    import settings as st
+    from options_dialog import OptionsDialog
+    app_log.setup(to_file=False)
+    logging.getLogger("test_engines").info("marker line 4711")
+    d = OptionsDialog(st.Settings())
+    d.show_log.click()
+    assert d.log_window is not None and d.log_window.isVisible()
+    assert d.log_window.isWindow()
+    d.log_window.refresh()
+    assert "marker line 4711" in d.log_window.view.toPlainText()
+    d.log_window.close()
+
+
+# ── logging without a console ───────────────────────────────────────────────
+def test_setup_survives_having_no_console_and_keeps_recent_lines(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        app_log.setup(to_file=True, env={"LOCALAPPDATA": str(tmp_path)})
+        print("libraries may still print")                   # must not raise
+        logging.getLogger("x").info("to the file %d", 7)
+        for h in root.handlers:
+            h.flush()
+        assert "to the file 7" in app_log.log_file({"LOCALAPPDATA": str(tmp_path)}).read_text(encoding="utf-8")
+        assert "to the file 7" in app_log.memory().text()
+    finally:
+        for h in list(root.handlers):
+            if h not in before:
+                root.removeHandler(h)
+                h.close()
+
+
+def test_memory_handler_is_bounded():
+    h = app_log.MemoryHandler(capacity=3)
+    h.setFormatter(logging.Formatter("%(message)s"))
+    for i in range(10):
+        h.emit(logging.LogRecord("n", logging.INFO, "", 0, f"line {i}", None, None))
+    assert h.text() == "line 7\nline 8\nline 9" and h.count == 10
+
+
+# ── the window: switching recogniser reloads it ─────────────────────────────
+def test_changing_the_recogniser_in_options_reloads_the_engine(qapp, make_window):
+    built = []
+
+    def factory():
+        built.append(FakeEngine())
+        return built[-1]
+
+    w = make_window(engine_factory=factory)
+    assert len(built) == 1 and w.ready
+    w.apply_settings(replace(w._settings, engine="parakeet"))
+    assert not w.ready                                         # reloading: dictation is off for a moment
+    assert wait_for(lambda: w.ready, app=qapp)
+    assert len(built) == 2 and w._transcriber.engine is built[1]
+    w.apply_settings(replace(w._settings, chime_volume=40))    # an unrelated change does not reload
+    assert len(built) == 2 and w.ready
+
+
+def test_a_model_that_is_not_downloaded_asks_first(qapp, make_window, monkeypatch):
+    calls = []
+
+    def factory():
+        calls.append(w_holder[0]._allow_download if w_holder else False)
+        if len(calls) == 1:
+            raise engines.ModelNotDownloaded("whisper")
+        return FakeEngine()
+
+    w_holder = []
+    import gui_med
+    asked = []
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download",
+                        lambda self, engine: asked.append(engine) or True)
+    w = make_window(engine_factory=factory)                    # make_window waits for ready or an error
+    w_holder.append(w)
+    assert wait_for(lambda: w.ready, app=qapp)
+    assert asked == ["whisper"] and len(calls) == 2
+
+
+def test_declining_the_download_leaves_a_clear_message(qapp, make_window, monkeypatch):
+    import gui_med
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download", lambda self, engine: False)
+
+    def factory():
+        raise engines.ModelNotDownloaded("parakeet")
+
+    w = make_window(engine_factory=factory)
+    assert wait_for(lambda: "not on this PC" in w._text_area.toPlainText(), app=qapp)
+    assert not w.ready and "Show log" in w._text_area.toPlainText()
+    time.sleep(0)
+
+
+@pytest.mark.parametrize("download", [False, True])
+def test_without_the_download_the_installers_own_model_stands_in(qapp, make_window, monkeypatch, download):
+    """Declined (or the download failed): an install that came with small.en uses it, and says so."""
+    import gui_med
+    monkeypatch.setattr(engines, "fallback_model", lambda name: Path("small.en") if name == "whisper" else None)
+    monkeypatch.setattr(gui_med.MedTranscriptionWindow, "_confirm_download", lambda self, engine: download)
+    calls = []
+
+    def factory():
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise engines.ModelNotDownloaded("whisper")
+        if download and len(calls) == 2:
+            raise OSError("no connection to huggingface.co")
+        return FakeEngine()
+
+    w = make_window(engine_factory=factory)
+    assert wait_for(lambda: w.ready, app=qapp)
+    assert len(calls) == (3 if download else 2) and w._fell_back
+    assert w._text_area.toPlainText() == (gui_med.DOWNLOAD_FAILED_TEXT if download else gui_med.FALLBACK_TEXT)
+
+
+def test_the_stand_in_is_the_installers_processor_model(monkeypatch, tmp_path):
+    import fw_engine
+    import hw_profile
+    for var in ("MYTRANSCRIBE_MODEL", "MYTRANSCRIBE_DEVICE", "MYTRANSCRIBE_COMPUTE_TYPE"):
+        monkeypatch.delenv(var, raising=False)
+    assert engines.fallback_model("whisper") is None                     # development checkout: nothing to use
+    monkeypatch.setattr(engines, "bundled_model", lambda name: tmp_path / name if name == "small.en" else None)
+    assert engines.fallback_model("whisper") == tmp_path / "small.en" and engines.fallback_model("medasr") is None
+    card = hw_profile.HardwareInfo(cuda_device_count=1, gpu_name="NVIDIA GeForce RTX 4070 Ti SUPER", vram_mb=16376,
+                                   compute_capability=8.9, cuda_compute_types=frozenset({"int8_float16"}))
+    loaded = []
+    monkeypatch.setattr(hw_profile, "detect_hardware", lambda: card)
+    monkeypatch.setattr(fw_engine, "register_cuda_dll_dirs", lambda: [])
+    monkeypatch.setattr(fw_engine, "FasterWhisperEngine", lambda cfg: loaded.append(cfg) or object())
+    engines._build("whisper", accurate=True)
+    assert loaded[-1].model == "large-v3"                                # not here: the caller asks first
+    engines._build("whisper", accurate=True, fallback=True)
+    assert (loaded[-1].model, loaded[-1].device) == (str(tmp_path / "small.en"), "cuda")   # on the card
+
+
+
+# ── dictation language ──────────────────────────────────────────────────────
+def test_language_setting_default_env_and_bad_values(tmp_path):
+    import settings as st
+    assert st.Settings().language == "en"
+    assert st.Settings(language="xx").clean().language == "en"
+    assert st.load(tmp_path / "none.json", env={"MYTRANSCRIBE_LANGUAGE": "fr"}).language == "fr"
+
+
+def test_options_offers_languages_and_explains_what_changes(qapp, monkeypatch):
+    import settings as st
+    from options_dialog import OptionsDialog
+    monkeypatch.setattr(engines, "availability", lambda name, **k: (True, ""))
+    monkeypatch.setattr(engines, "missing_packages", lambda name, *a: [])
+    d = OptionsDialog(st.Settings())
+    assert [d.language.itemData(i) for i in range(d.language.count())] == ["en", "es", "fr"]   # Swahili not offered
+    assert "(experimental)" in d.language.itemText(1) and "(experimental)" not in d.language.itemText(0)
+    assert "spelling correction are off" not in d.engine_note.text()
+    d.language.setCurrentIndex(d.language.findData("fr"))
+    assert "experimental" in d.engine_note.text() and "spelling correction are off" in d.engine_note.text()
+    d = OptionsDialog(st.Settings(language="sw"))           # chosen by MYTRANSCRIBE_LANGUAGE: shown
+    assert "NOT reviewed" in d.engine_note.text() and "spelling correction are off" in d.engine_note.text()
+    d.engine.setCurrentIndex(d.engine.findData("medasr"))
+    assert "Only Whisper understands this language" in d.engine_note.text()
+    assert d.result_settings().language == "sw"
+
+
+def test_switching_language_retargets_the_engine_and_turns_english_aids_off(qapp, make_window):
+    engine = FakeEngine()
+    engine.language = "en"
+    w = make_window(engine=engine)
+    corrector_marker = "corrector"
+    w._text_pipeline = ("builder", corrector_marker)
+    w.apply_settings(replace(w._settings, language="es", spoken_punctuation=True))
+    assert engine.language == "es"
+    assert w._transcriber.prompt_builder is None
+    assert w._transcriber.postprocess is not corrector_marker      # the English corrector is not used
+    assert "metformina" in w._transcriber.base_prompt and "Nuevo párrafo" in w._transcriber.base_prompt
+    assert w._format("dolor torácico coma sin disnea punto y aparte plan dos puntos reposo punto") == \
+        "dolor torácico, sin disnea.\n\nPlan: reposo."
+    w.apply_settings(replace(w._settings, language="en"))
+    assert engine.language == "en"
+    assert (w._transcriber.prompt_builder, w._transcriber.postprocess) == ("builder", "corrector")
+    assert w._format("stable period") == "stable."
+
+
+def test_an_english_only_recogniser_ignores_the_language(qapp, make_window):
+    w = make_window()                                          # FakeEngine has no language attribute
+    w.apply_settings(replace(w._settings, language="fr", spoken_punctuation=True))
+    assert w._format("stable period") == "stable."            # still formatted as English

@@ -1,0 +1,367 @@
+"""
+voice_commands.py — spoken formatting commands, applied to the final text.
+
+  "new line" / "next line"   -> line break
+  "new paragraph"            -> blank line
+  "open quote(s)" ... "close quote(s)" / "end quote(s)" / "unquote"  -> "..."
+  "<number> period" at the start of a line                          -> "2. "
+      e.g. "... new line, 2 period, Xerostomia. Start water-based lubricant."
+      -> "\n2. Xerostomia. Start water-based lubricant." Only at a line start, so
+      "her last period" or "2 periods of chest pain" mid-sentence are untouched.
+
+Conservative on purpose: a phrase only counts as a command when Whisper set it
+off with punctuation on at least one side (or it starts/ends the text), which is
+how it transcribes a spoken command ("...2 weeks. New line, follow up..."). In
+"start a new line of therapy" nothing separates "new line" from its neighbours,
+so it stays text. Pure functions; nothing is logged.
+
+apply(text, lenient=True) (used by the pause-aware pipeline) also accepts a
+command the model wrote without any punctuation, which happens when it loses
+its punctuation for a stretch ("...chest is clear new paragraph the abdomen is soft..."):
+  * "new paragraph" always counts: nobody dictates those two words as text;
+    the sentence before it gets its missing full stop;
+  * "new line" counts unless its neighbours show it is a noun phrase
+    ("a new line of therapy", "the new line on the film", "new line was placed").
+Quotes and list numbers are unchanged. The default (lenient=False) is the
+original behaviour.
+
+apply(text, punctuation=True) (Options -> "Spoken punctuation", off by default)
+also converts dictated marks, for people who say them:
+  "period" / "full stop" -> .    "comma" -> ,    "colon" -> :    "semicolon" -> ;
+  "question mark" -> ?    "exclamation mark|point" -> !    "hyphen" -> joins the
+  two words    "open paren(thesis)|bracket" ... "close paren(thesis)|bracket" -> ( )
+The dictated mark replaces whatever the model put after the word ("stable
+period. He" -> "stable. He"; "Plan colon, rest" -> "Plan: rest"). "period" and
+"colon" are also ordinary clinical words, so they stay text when the words
+around them make them a noun: "her last period", "a normal period", "period
+of observation", "the sigmoid colon", "colon cancer". That guard is a word
+list, not understanding: with the option on, an unusual noun use can still be
+converted, which is why it is a choice.
+"""
+
+import re
+
+PUNCT = ",.;:!?"
+# A few words of dictation with the commands spoken, appended to Whisper's style prompt
+# when Spoken punctuation is on. Whisper treats its prompt as what came before; with this
+# example it keeps a spoken "open quote" or "new paragraph" instead of dropping it as an
+# aside (fictional validation set: commands 39/40 -> 40/40; owner's development
+# recordings: 52/58 -> 54/58, no change for the worse elsewhere).
+DICTATION_EXAMPLE = ("The chest is clear, period. New paragraph. No fever, comma, no cough, period. New line. "
+                     "Open quote, rest, close quote, period.")
+# The same example for someone who says the layout commands but not the marks. Tried on
+# 2026-11-18 and not adopted: on the owner's real recordings it kept no more commands
+# (110/114 either way) and laid out 22 letters right instead of 24. The scripts keep it to
+# reproduce that note (docs/optimization/2026-11-18-settings-suite-fixes.md).
+LAYOUT_EXAMPLE = "The chest is clear. New paragraph. No fever, no cough. New line. Open quote, rest, close quote."
+_BREAKS = [(re.compile(r"\bnew\s+paragraph\b", re.I), "\n\n"),
+           (re.compile(r"\b(?:new|next)\s+line\b", re.I), "\n")]
+_NUMBER_WORDS = {w: str(i) for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+    "sixteen seventeen eighteen nineteen twenty".split())}
+# At a line start: "2 period," / "2. Period." / "two period" / "number 2 period" / "2 full stop",
+# and the forms Whisper wrote from real speech: "2 periods," / "2. 2 periods,".
+_NUM = r"(?:\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")"
+_LIST_ITEM = re.compile(
+    r"(^|\n)[ \t]*(?:number[ \t]+)?(" + _NUM + r")[ \t]*[.,]?[ \t]*(?:" + _NUM + r"[ \t]*)?"
+    r"(?:periods?|full[ \t]+stops?|dot)\b[ \t]*[.,:;]*[ \t]*", re.I)
+_OPEN = re.compile(r"\bopen\s+quotes?\b", re.I)
+_CLOSE = re.compile(r"\b(?:close\s+quotes?|end\s+quotes?|unquote)\b", re.I)
+
+
+# lenient "new line": words that make it a noun phrase rather than a command.
+_LINE_NOT_AFTER = {"a", "an", "the", "this", "that", "another", "any", "no", "one", "her", "his", "their",
+                   "our", "its", "each", "every", "second", "third", "of", "with", "for", "and", "or"}
+_LINE_NOT_BEFORE = {"of", "on", "in", "at", "to", "for", "was", "is", "has", "had", "were", "are", "placed",
+                    "inserted", "started", "sited", "and", "or", "that", "which", "infection", "site"}
+
+
+# A dictated sentence end just before "new line": "... this year period new line on examination".
+_SAID_END = re.compile(r"\b(period|full[ \t]+stop|question[ \t]+mark)[ \t]*[.,]?[ \t]*$", re.I)
+# Clinical headings that start a line with "on": "new line on examination ..." is a command.
+_ON_HEADING = {"examination", "exam", "auscultation", "inspection", "palpation", "assessment", "review", "arrival",
+               "admission", "discharge"}
+
+
+def _lenient_ok(text: str, start: int, end: int, paragraph: bool) -> bool:
+    """An unpunctuated "new paragraph" / "new line" that still reads as a command."""
+    if paragraph:
+        return True
+    left = text[:start]
+    said_end = _SAID_END.search(left)
+    if said_end and not _is_noun(re.sub(r"\s+", " ", said_end.group(1).lower()), left[:said_end.start()],
+                                 text[said_end.end():]):
+        return True                                   # the speaker just dictated a full stop
+    before = re.findall(r"[A-Za-z']+", left)
+    after = re.findall(r"[A-Za-z']+", text[end:end + 40])
+    if before and before[-1].lower() in _LINE_NOT_AFTER:
+        return False                                  # "a new line", "the new line"
+    if len(after) > 1 and after[0].lower() == "on" and after[1].lower() in _ON_HEADING:
+        return True                                   # "new line on examination ..."
+    return not (after and after[0].lower() in _LINE_NOT_BEFORE)
+
+
+def _set_off(text: str, start: int, end: int) -> bool:
+    """True if text[start:end] has punctuation (or the text edge) on at least one side."""
+    left = text[:start].rstrip(" ")
+    right = text[end:].lstrip(" ")
+    edge = PUNCT + "\n\x03\x04"                    # a line or paragraph break just made also sets it off
+    return (not left or left[-1] in edge) or (not right or right[0] in edge)
+
+
+def _replace_commands(text: str, pattern, token: str, lenient: bool = False) -> str:
+    """Replace set-off matches with a placeholder token, eating the punctuation around them."""
+    out, pos = [], 0
+    for m in pattern.finditer(text):
+        set_off = _set_off(text, m.start(), m.end())
+        if not set_off and not (lenient and token in ("\x03", "\x04")
+                                and _lenient_ok(text, m.start(), m.end(), token == "\x03")):
+            continue
+        left = text[pos:m.start()].rstrip(" ")
+        if token in ("\x03", "\x04"):            # line break: keep a full stop, drop , ; :
+            left = left.rstrip(",;:")
+            if lenient and token == "\x03" and left and left[-1].isalnum():
+                left += "."                       # a paragraph ends its sentence
+        elif token == "\x02":                     # closer: drop the comma Whisper puts before it
+            left = left.rstrip(PUNCT)
+        out.append(left)
+        out.append(token)
+        pos = m.end()
+        while pos < len(text) and text[pos] in PUNCT + " ":
+            if text[pos] in PUNCT and token == "\x02":
+                break                             # "close quote." keeps its full stop
+            pos += 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+# ── Spoken punctuation marks ─────────────────────────────────────────────────
+_MARKS = {"period": ".", "full stop": ".", "comma": ",", "colon": ":", "semicolon": ";", "semi-colon": ";",
+          "question mark": "?", "exclamation mark": "!", "exclamation point": "!"}
+_MARK = re.compile(r"(?<![\w-])(" + "|".join(k.replace(" ", r"[ \t]+") for k in sorted(_MARKS, key=len, reverse=True))
+                   + r")(?![\w-])", re.I)
+_DETERMINERS = {"a", "an", "the", "this", "that", "her", "his", "my", "your", "their", "our", "each", "every",
+                "per", "any", "no", "one", "same", "which", "what"}
+# "period" as a noun: directly after a determiner, after one of these adjectives
+# with a determiner or another of them just before ("a normal period", "her last
+# menstrual period"), or before one of the followers ("period of observation").
+_PERIOD_ADJ = {"last", "first", "next", "previous", "menstrual", "missed", "late", "heavy", "light", "irregular",
+               "regular", "normal", "time", "long", "short", "brief", "prolonged", "extended", "incubation",
+               "recovery", "observation", "trial", "refractory", "latent", "postoperative", "perioperative",
+               "postpartum", "neonatal", "washout", "waiting", "follow-up", "study", "treatment", "initial",
+               "whole", "entire", "second", "third", "monthly", "painful"}
+# Words after which "her" is a person, not the owner of a period.
+_HER_IS_OBJECT = {"seeing", "see", "saw", "seen", "for", "to", "with", "told", "tell", "advised", "advise", "called",
+                  "call", "gave", "give", "asked", "ask", "about", "examined", "reviewed", "reassured", "referred",
+                  "refer", "thank", "thanked", "help", "helping", "assess", "assessing", "from", "by", "let",
+                  "inform", "informed", "treat", "treated", "met", "discharged", "discharge", "following",
+                  "assessed", "review", "contact", "contacted", "phoned", "book", "booked", "send", "sent"}
+_PERIOD_NEXT = {"of", "was", "is", "has", "had", "pain", "pains", "cramps", "lasted", "started", "due",
+                "when", "during", "between"}
+_COLON_PREV = _DETERMINERS | {"of", "sigmoid", "ascending", "descending", "transverse", "proximal", "distal", "left",
+                              "right", "entire", "whole", "in", "to", "and", "or", "redundant", "irritable",
+                              "spastic", "toxic", "normal", "large", "dilated", "remaining", "throughout"}
+_COLON_NEXT = {"cancer", "carcinoma", "polyp", "polyps", "resection", "was", "is", "wall", "mass", "biopsy",
+               "and", "or", "showed", "appears", "appeared", "tumour", "tumor", "lesion", "adenocarcinoma",
+               "screening", "with", "to", "at", "has", "had", "were", "are", "cleansing", "prep", "preparation"}
+_OPEN_PAREN = re.compile(r"[ \t]*[,;:]?[ \t]*\b(?:open|left)[ \t]+(?:paren(?:thesis|theses)?|brackets?)\b[ \t]*[.,;:]*[ \t]*", re.I)
+_CLOSE_PAREN = re.compile(r"[ \t]*[.,;:]*[ \t]*\b(?:close|right|end)[ \t]+(?:paren(?:thesis|theses)?|brackets?)\b",
+                          re.I)
+_HYPHEN = re.compile(r"(?<=\w)[ \t]*,?[ \t]+hyphen\b[ \t]*[.,]?[ \t]+(?=\w)", re.I)
+_WORD = re.compile(r"[A-Za-z][A-Za-z'-]*")
+_LINE_START = "\n\x03\x04"                       # real breaks and apply()'s break placeholders
+# "2 period" opening a line is a list number; _LIST_ITEM converts it.
+_LIST_HEAD = re.compile(r"(?:^|[" + _LINE_START + r"])[ \t]*(?:number[ \t]+)?" + _NUM + r"[ \t]*[.,]?[ \t]*(?:"
+                        + _NUM + r"[ \t]*)?$", re.I)
+
+
+def _is_noun(word: str, before: str, after: str) -> bool:
+    """True when "period" / "colon" at this place reads as an ordinary word."""
+    if word == "period" and _LIST_HEAD.search(before):
+        return True
+    before = re.split(r"[" + re.escape(PUNCT) + _LINE_START + r"]", before)[-1]   # same clause only
+    prev = [w.lower() for w in _WORD.findall(before[-40:])][-2:]
+    nxt = _WORD.match(after.lstrip(" \t"))
+    nxt = nxt.group(0).lower() if nxt else ""
+    if word == "period":
+        if len(prev) > 1 and prev[-1] == "her" and prev[-2] in _HER_IS_OBJECT:
+            return False                              # "thank you for seeing her period": her = the patient
+        return nxt in _PERIOD_NEXT or (bool(prev) and (
+            prev[-1] in _DETERMINERS
+            or (prev[-1] in _PERIOD_ADJ and len(prev) > 1 and prev[-2] in _DETERMINERS | _PERIOD_ADJ)))
+    if word == "colon":
+        return nxt in _COLON_NEXT or (bool(prev) and prev[-1] in _COLON_PREV)
+    return False
+
+
+def _sentence_capital(text: str, pos: int) -> bool:
+    """
+    Is the capital at text[pos] only there because the model ended a sentence at a
+    dictated comma? Ordinary words only: "I", abbreviations (ECG) and words that are
+    not everyday English (names, brands) keep their capital.
+    """
+    m = _WORD.match(text, pos)
+    if not m or not text[pos].isupper():
+        return False
+    word = m.group(0)
+    if word == "I" or word.startswith(("I'", "I’")) or not word[1:].islower() and len(word) > 1:
+        return False
+    if text[m.end():m.end() + 1].isdigit():
+        return False                                  # "A1c", "B12", "T4": a term, not an ordinary word
+    if text[m.end():m.end() + 1] == "." or word.lower() in _TITLE_WORDS:
+        return False                                  # "Dr. Patel", "Doctor Patel"
+    return _common_word(word.lower())
+
+
+_TITLE_WORDS = {"dr", "doctor", "mr", "mrs", "ms", "miss", "prof", "professor", "nurse", "sister", "father"}
+_zipf = None
+
+
+def _common_word(word: str) -> bool:
+    global _zipf
+    if _zipf is None:
+        try:
+            from wordfreq import zipf_frequency
+            _zipf = lambda w: zipf_frequency(w, "en")      # noqa: E731
+        except ImportError:                                 # without word data: a short list of sure cases
+            sure = {"it", "this", "that", "the", "she", "he", "they", "we", "and", "but", "so", "then", "which",
+                    "there", "her", "his", "a", "an", "in", "on", "with", "was", "is", "no", "not"}
+            _zipf = lambda w: 6.0 if w in sure else 0.0    # noqa: E731
+    return _zipf(word) >= 4.0
+
+
+_HESITATION = re.compile(r"(?<=\w)[ \t]*(?:\.\.\.|…)(?=[ \t]+[a-z])")
+
+
+def drop_hesitations(text: str) -> str:
+    """
+    "She did not tolerate... dulaglutide": the model writes a pause in the middle of
+    a sentence as "...". Someone who dictates every mark did not say it.
+    Only a "..." followed by a lower-case word is removed; one that ends a
+    sentence or the text is left alone.
+    """
+    return _HESITATION.sub("", text)
+
+
+_DICTATED_COMMA = "\x08"          # a comma that was said, while only-dictated-commas is sorting them out
+
+
+def spoken_marks(text: str, tag_commas: bool = False) -> str:
+    """Dictated punctuation marks -> the marks (see the module docstring)."""
+    text = _CLOSE_PAREN.sub(")", _OPEN_PAREN.sub(" (", text))
+    text = _HYPHEN.sub("-", text)
+    out, pos = [], 0
+    for m in _MARK.finditer(text):
+        word = re.sub(r"\s+", " ", m.group(1).lower())
+        if _is_noun(word, text[:m.start()], text[m.end():]):
+            continue
+        left = text[pos:m.start()].rstrip(" \t")
+        while left and left[-1] in PUNCT:             # the dictated mark replaces the model's own
+            left = left[:-1].rstrip(" \t")
+        out.append(left)
+        written = "".join(out)
+        if written and written[-1] not in PUNCT + _LINE_START + "(":
+            mark = _MARKS[word]                       # nothing to attach to at a text or line start
+            out.append(_DICTATED_COMMA if tag_commas and mark == "," else mark)
+        pos = m.end()
+        while pos < len(text) and text[pos] in PUNCT + " \t":
+            pos += 1
+        if pos < len(text) and text[pos] not in _LINE_START and written and written[-1] not in _LINE_START:
+            out.append(" ")
+        if pos < len(text) and _MARKS[word] in ".?!" and text[pos].islower():
+            out.append(text[pos].upper())
+            pos += 1
+        elif pos < len(text) and _MARKS[word] in ",;" and _sentence_capital(text, pos):
+            out.append(text[pos].lower())             # the model wrote "comma. It was": no new sentence here
+            pos += 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _open_missing_quotes(text: str) -> str:
+    """
+    The model sometimes leaves out a spoken "open quote" but keeps the "close
+    quote". When a line that follows a dictated break has a closing quote and
+    no opening one, the quote is taken to start with the line ("new paragraph,
+    open quote, X-ray normal, close quote"). The first line is left alone:
+    there is no telling where its quote began.
+    """
+    parts = re.split(r"([\x03\x04])", text)
+    for i in range(2, len(parts), 2):
+        line = parts[i]
+        close = line.find("\x02")
+        if close != -1 and "\x01" not in line[:close]:
+            parts[i] = "\x01" + line.lstrip(" ")
+    return "".join(parts)
+
+
+# -- A letter's greeting and sign-off, laid out when they were not (natural speech, or a
+# command the model dropped). Only these two: a body's paragraphs cannot be told from the
+# words alone.
+_SALUTATION = re.compile(r"(^|\n)([ \t]*(?:Dear\b[^\n,:!?]{1,60}|To whom it may concern)[,:])[ \t]+(?=[A-Z])")
+_CLOSING = (r"(?:(?:With )?[Kk]ind regards|Best regards|Warm regards|Regards|Yours sincerely|Sincerely|"
+            r"Yours truly|Yours faithfully|Best wishes|Many thanks|With thanks|Thank you|Thanks)")
+_NAME = r"(?:(?:Dr\.?|Doctor)[ \t]+)?[A-Z][\w'’-]*\.?(?:[ \t]+[A-Z][\w'’-]*\.?){0,3}"
+_GREETING_STOP = re.compile(r"(?:^|(?<=\n))([ \t]*Dear[ \t]+(?:(?:Dr|Mr|Mrs|Ms|Miss|Mx|Prof|Doctor)\.?[ \t]+)?"
+                            r"[A-Z][\w'’-]*(?:[ \t]+[A-Z][\w'’-]*){0,2})\.(?=[ \t]*\n)")
+_SIGN_OFF = re.compile(r"(?:(?<=[.!?])[ \t]+|(\n+))(" + _CLOSING + r")[,.]?[ \t]+(" + _NAME + r")[ \t]*$")
+
+
+def letter_layout(text: str, spoken_layout: bool = False) -> str:
+    """
+    'Dear Dr. Mbeki, I would be grateful ...' -> greeting on its own line, a blank line after;
+    '... treatment. Kind regards, Dr. Owen Gallagher.' -> 'Kind regards,' in a paragraph of its
+    own with the name on the next line. Only for someone who said no layout command at all
+    (spoken_layout False): whoever says "new paragraph" lays the letter out as they want it.
+    A greeting the model ended with a full stop gets its comma in any case.
+    """
+    text = _GREETING_STOP.sub(r"\1,", text, count=1)          # "Dear Dr. Castillo." -> "Dear Dr. Castillo,"
+    if spoken_layout:
+        return text
+    text = _SALUTATION.sub(lambda m: m.group(1) + m.group(2) + "\n\n", text, count=1)
+
+    def sign_off(m):
+        name = m.group(3).rstrip(".") if not re.search(r"\b[A-Z]\.$", m.group(3)) else m.group(3)
+        return (m.group(1) or "\n\n") + m.group(2) + ",\n" + name
+    return _SIGN_OFF.sub(sign_off, text, count=1)
+
+
+def apply(text: str, lenient: bool = False, punctuation: bool = False, only_dictated_commas: bool = False) -> str:
+    """
+    Return `text` with spoken formatting commands turned into formatting.
+    lenient=True also accepts "new paragraph" / "new line" written without
+    punctuation; punctuation=True also converts dictated marks ("period",
+    "comma", ...). See the module docstring.
+
+    only_dictated_commas=True (with punctuation) is for people who say every
+    comma: the commas the model adds by itself ("normal, with
+    no murmurs" when no comma was said) are removed and only spoken ones stay.
+    Commas inside numbers ("1,000") are kept.
+    """
+    if not text:
+        return text
+    for pattern, br in _BREAKS:
+        text = _replace_commands(text, pattern, "\x03" if br == "\n\n" else "\x04", lenient)
+    spoken_layout = "\x03" in text or "\x04" in text
+    strict = punctuation and only_dictated_commas
+    if punctuation:
+        text = spoken_marks(drop_hesitations(text), tag_commas=strict)
+    text = _replace_commands(text, _OPEN, "\x01")
+    text = _replace_commands(text, _CLOSE, "\x02")
+    if lenient:
+        text = _open_missing_quotes(text)
+    if strict:
+        text = re.sub(r"(?<!\d),|,(?!\d)", "", text).replace(_DICTATED_COMMA, ",")
+    text = text.replace("\x03", "\n\n").replace("\x04", "\n")
+    text = re.sub(r"[ \t]*\x01[ \t]*", ' "', text)   # opening quote: space before, none after
+    text = re.sub(r"[ \t]*\x02", '"', text)          # closing quote: hug the last word
+    text = re.sub(r'(^|\n) "', r'\1"', text)         # no space before a quote at line start
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip(" \n")
+    text = letter_layout(text, spoken_layout)
+    text = _LIST_ITEM.sub(lambda m: f"{m.group(1)}{_NUMBER_WORDS.get(m.group(2).lower(), m.group(2))}. ", text)
+    # Capitalise the first letter of each new line / list item (and of a quote opening
+    # it). The very start of the text is left as dictated: it may be pasted mid-sentence.
+    text = re.sub(r'(^\d{1,2}\. |\n\d{1,2}\. )("?)([a-z])', lambda m: m.group(1) + m.group(2) + m.group(3).upper(), text)
+    return re.sub(r'(\n)("?)([a-z])', lambda m: m.group(1) + m.group(2) + m.group(3).upper(), text)

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Installer builds and speech models
+dist/
+models/
+*.exe
+*.data
+
+# Recordings and results never go in the repository
+*.wav
+*.flac
+*.mp3
+results*/
