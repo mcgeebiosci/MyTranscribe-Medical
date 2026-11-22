@@ -180,7 +180,8 @@ def test_qt_ships_under_the_lgpl_with_the_gpl_text_it_builds_on(tmp_path):
 def test_the_installer_shows_the_licence_terms_and_asks_for_windows_11(tmp_path):
     notice = (bi.HERE / "LICENSE-NOTICE.txt").read_text(encoding="utf-8")
     assert "MIT License" in notice and "GNU LGPL version 3" in notice and "not a medical device" in notice
-    assert "PyQt" not in notice and len(notice.splitlines()) < 60                 # short: details are installed
+    assert "PyQt" not in notice and len(notice.splitlines()) < 80                 # short: details are installed
+    assert "small open-source project" in notice and "not liable for any loss, injury or damage" in notice
     if bi.CSC.is_file():
         exe = bi.compile_stub(tmp_path, bi.REPO / "src" / "assets" / "mytranscribe.ico").read_bytes()
         for text in ("I accept the licence terms", "LICENSE-NOTICE.txt", " needs Windows 11."):
